@@ -82,7 +82,7 @@ def carregar_cadastros():
         'stakes': sb_get('stakes_historico?select=tipster_id,valor_reais,vigente_a_partir'),
     }
 
-def extrair_aposta(imagem_bytes, descricao_msg, cadastros, data_hoje):
+def extrair_aposta(imagem_bytes, descricao_msg, cadastros, data_hoje, operador_msg=None):
     """Usa Claude Vision pra extrair dados da imagem + descrição da mensagem."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
@@ -91,48 +91,62 @@ def extrair_aposta(imagem_bytes, descricao_msg, cadastros, data_hoje):
     operadores_lista = [o['nome'] for o in cadastros['operadores']]
     esportes_lista = [e['nome'] for e in cadastros['esportes']]
 
-    prompt = f"""Você é o sistema automatizado de planilhamento do Mercado Esportivo.
+    prompt = f"""Você é o sistema automatizado de planilhamento do Mercado Esportivo. Opera com julgamento humano.
 
-Analise o PRINT DE APOSTA em anexo e a descrição do operador abaixo, extraindo os dados pra registro no dashboard.
+Analise o PRINT DE APOSTA em anexo combinado com a descrição que o operador adicionou.
 
-DESCRIÇÃO DO OPERADOR: "{descricao_msg or '(sem descrição)'}"
+QUEM ENVIOU (operador): "{operador_msg or '(desconhecido)'}"
+DESCRIÇÃO: "{descricao_msg or '(sem descrição)'}"
+DATA DE HOJE: {data_hoje}
 
-CADASTROS EXISTENTES (use o nome EXATAMENTE como está aqui, se identificar):
+CADASTROS EXISTENTES — use o nome EXATAMENTE como aparece aqui:
 - Tipsters: {json.dumps(tipsters_lista, ensure_ascii=False)}
 - Bookies: {json.dumps(bookies_lista, ensure_ascii=False)}
 - Operadores: {json.dumps(operadores_lista, ensure_ascii=False)}
 - Esportes: {json.dumps(esportes_lista, ensure_ascii=False)}
 
-INSTRUÇÕES:
-1. Leia o print com cuidado. Pode ser um bilhete do tipster ou da própria casa.
-2. Extraia o máximo de informações possíveis.
-3. SE o print contém MÚLTIPLAS apostas independentes (vários bilhetes no mesmo print), retorne um ARRAY de apostas.
-4. Se o print é UMA aposta só (mesmo que seja múltipla combinada), retorne um array com 1 item.
-5. Se NÃO tiver certeza de algum campo, deixe NULL (não chute).
-6. Para stake_unidades: se o print mostrar em unidades (tipo "1u", "0.5u"), use esse valor. Se mostrar em R$, tente descobrir as unidades pela descrição. Se não conseguir, deixe NULL.
-7. Se a descrição mencionar o tipster pelo nome, use esse. Se o print é do próprio tipster (bilhete compartilhado), tente identificar pelo cabeçalho/marca.
-8. Se a data do evento não aparecer no print nem na descrição, assuma HOJE ({data_hoje}).
-9. Status sempre: "PENDING".
-10. Tipo de aposta: "Simples" (1 seleção), "Dupla" (2), "Tripla" (3), "Múltipla" (4+), "Criar Aposta" (combinadas dentro da casa). Se não der pra inferir, null.
+REGRAS IMPORTANTES:
 
-FORMATO DE RESPOSTA (JSON puro, sem markdown, sem ```, só o JSON):
+A. OPERADOR: use o nome "{operador_msg}" (quem enviou o print). Se bater com algum nome da lista de operadores, use o nome exato do cadastro. Se não bater, deixe como está.
+
+B. TIPSTER: deduza pelo cabeçalho/título do print. Se aparecer "BH Tipster", provavelmente é "BH CS". Se aparecer "GOA", pode ser "GOA TOM", "GOA Fut Fem", "GOA Tradicional" (use contexto da aposta pra decidir qual). Correlacione com a lista de tipsters.
+
+C. ESPORTE: INFIRA pelo contexto — nome dos times, torneio, tipo de mercado. Exemplos:
+   - "1W x GenOne" + "Handicap de rondas" → Counter-Strike
+   - "Nice x Le Havre" → Futebol
+   - "Lakers x Warriors" → Basquete
+   - Se ver "Mapa 3", "rondas", "kills" → Counter-Strike/Esports
+   Use o nome do esporte EXATAMENTE como aparece no cadastro.
+
+D. DATA DO EVENTO: se o print diz "LIVE" ou "AO VIVO", é HOJE. Se você reconhece os times e sabe que há uma partida marcada entre eles numa data específica, use essa data. Se não, use HOJE ({data_hoje}).
+
+E. STAKE: o print normalmente mostra em unidades (ex: "2u", "1u", "0.5u"). Se mostrar R$, use o valor direto e deixe pro dashboard converter. Se a descrição do operador contradizer o print (ex: print diz 2u mas operador escreveu "apostei 1u"), use o da descrição.
+
+F. BOOKIE e CONTAS: vêm da descrição do operador. Ex: "bet365 luciadritrich" → bookie: Bet365, contas: luciadritrich. Se a casa só aparece sozinha sem conta, apenas informe o bookie.
+
+G. MÚLTIPLAS APOSTAS: se o print contém vários bilhetes independentes (ex: duas entradas separadas), retorne múltiplos itens. Se é UMA aposta (mesmo múltipla combinada dentro de 1 bilhete), retorne 1 item com tipo_aposta correto.
+
+H. TIPO DE APOSTA: "Simples" (1 seleção), "Dupla" (2), "Tripla" (3), "Múltipla" (4+), "Criar Aposta" (bet builder da casa). Se não der pra inferir, null.
+
+I. CONFIANÇA: se NÃO tiver certeza de algum campo, deixe NULL. É melhor null do que errado — o operador confere depois.
+
+FORMATO DE RESPOSTA (JSON puro, sem markdown):
 
 {{
   "apostas": [
     {{
       "data_evento": "YYYY-MM-DD" ou null,
-      "evento": "texto livre ex: Nice x Le Havre" ou null,
-      "esporte": "nome do esporte igual ao cadastro" ou null,
-      "mercado": "ex: Ambos Marcam, Over 2.5, Resultado Final" ou null,
-      "entrada": "ex: Sim, Over, Casa, Fulano p/ marcar" ou null,
+      "evento": "ex: 1W x GenOne" ou null,
+      "esporte": "nome igual ao cadastro" ou null,
+      "mercado": "ex: Handicap de rondas, Ambos Marcam" ou null,
+      "entrada": "ex: 1W -3.5 Mapa 3, Sim, Over" ou null,
       "odd": number ou null,
       "stake_unidades": number ou null,
       "tipo_aposta": "Simples|Dupla|Tripla|Múltipla|Criar Aposta" ou null,
       "tipster": "nome igual ao cadastro" ou null,
       "operador": "nome igual ao cadastro" ou null,
       "bookie": "nome igual ao cadastro" ou null,
-      "contas_utilizadas": "texto separado por vírgula" ou null,
-      "observacao": "qualquer detalhe relevante" ou null
+      "contas_utilizadas": "separadas por vírgula" ou null
     }}
   ]
 }}
@@ -211,7 +225,6 @@ def montar_linha(ap, cadastros):
         'operador_id': operador_id,
         'bookie_id': bookie_id,
         'contas_utilizadas': ap.get('contas_utilizadas'),
-        'observacao': ap.get('observacao'),
         'status': 'PENDING',
     }
     return {k: v for k, v in linha.items() if v is not None}
@@ -248,7 +261,10 @@ def processar_mensagem(msg, cadastros):
             return
 
         data_hoje = datetime.now(BRT).strftime('%Y-%m-%d')
-        resultado = extrair_aposta(img_bytes, texto, cadastros, data_hoje)
+        # Nome de quem enviou o print (operador)
+        from_user = msg.get('from') or {}
+        operador_nome = from_user.get('first_name') or from_user.get('username') or ''
+        resultado = extrair_aposta(img_bytes, texto, cadastros, data_hoje, operador_nome)
 
         apostas = resultado.get('apostas', [])
         if not apostas:
