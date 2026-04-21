@@ -243,8 +243,9 @@ G. QUANTAS APOSTAS RETORNAR — QUATRO CENÁRIOS (CRÍTICO, fonte comum de erro)
    - odd: 2.05 (ou a odd real da descrição se houver bônus)
 
    CENÁRIO 2 — Apostas paralelas no mesmo print (N apostas):
-   Várias seleções, cada uma com sua ODD INDIVIDUAL visível, possivelmente com uma linha adicional "Dupla/Tripla/Múltipla" mostrando uma odd combinada. Cada odd individual = 1 aposta simples potencial. A odd combinada = 1 aposta adicional.
-   A DESCRIÇÃO DO OPERADOR determina quais apostas foram efetivamente realizadas (tipicamente todas).
+   Várias seleções, cada uma com sua ODD INDIVIDUAL visível, possivelmente com uma linha/seção adicional "Dupla/Tripla/Múltipla" mostrando uma ODD COMBINADA SEPARADA. Cada odd individual = 1 aposta simples potencial. A odd combinada = 1 aposta ADICIONAL.
+   ATENÇÃO: quando o print mostra N odds individuais E uma seção destacada ao final tipo "Dupla", "Tripla", "Múltipla" com sua PRÓPRIA odd combinada (ex: "Tripla 104.50"), existem N+1 APOSTAS POTENCIAIS, não N nem 1. Ex: 3 jogadores com odds individuais 11.00, 4.00, 6.00 + "Dupla 66.00" no final = 3 simples + 1 dupla = 4 apostas potenciais. A descrição diz quais efetivamente aconteceram.
+   A DESCRIÇÃO DO OPERADOR determina quais apostas foram efetivamente realizadas (tipicamente todas, mas pode ter "out" marcando que pulou alguma — ver regra M).
 
    Ex: Print mostra:
    - Vitória (F) — odd 9.75
@@ -288,6 +289,30 @@ H. DESCRIÇÃO = N APOSTAS AUTOSSUFICIENTES (importante complemento ao Cenário 
    - Mapeamento da seleção: se a descrição tem identificador textual ("dupla", "chape", "vitória", "linha KOLESIE +4.5"), use. Se não, mapeie pela odd (linha com odd 1.72 mapeia pra seleção do print cuja odd é 1.72).
    - Se o operador escreveu a linha, é porque há algo diferente do print — NUNCA ignore uma linha da descrição assumindo que é redundante.
 
+M. GRAMÁTICA DE ESTADOS POSICIONAIS NA DESCRIÇÃO (padrão crescente de uso):
+   Um padrão comum de descrição é: "[bookie] [conta] [estado_1] [estado_2] [estado_3] ..."
+   Onde cada estado mapeia POSICIONALMENTE para as apostas do print, NA ORDEM em que aparecem (incluindo combinadas listadas ao final do print).
+
+   Estados possíveis:
+   - "out" → operador NÃO apostou essa. NÃO REGISTRAR essa aposta (pular completamente).
+   - "in" → operador apostou essa conforme o print (usa stake e odd do print como estão).
+   - NÚMERO SOZINHO (ex: "105", "105,00", "95.33") → operador apostou essa com STAKE em REAIS igual ao número. Odd segue o print (salvo ajustes por outros estados ou por regras F2/F3).
+   - "odd X.XX" → operador apostou essa com ODD REAL igual a X.XX (sobrescreve a odd do print, típico em drops ao vivo).
+   - Combinações: "105 odd 95.33" → stake_reais 105 + odd 95.33 pra mesma aposta.
+
+   REGRA DE DESAMBIGUAÇÃO CRÍTICA: número SOZINHO sempre é stake em reais; odd SÓ é odd quando precedida da palavra "odd". NUNCA inferir que um número grande é odd sem a palavra "odd" na frente.
+
+   Exemplo: descrição "365 will out in in in 95,33" com print mostrando 3 simples + 1 tripla:
+   - bookie: 365 (Bet365)
+   - conta: will
+   - aposta 1 (1ª simples): "out" → NÃO REGISTRAR
+   - aposta 2 (2ª simples): "in" → registrar com stake/odd do print
+   - aposta 3 (3ª simples): "in" → registrar com stake/odd do print
+   - aposta 4 (tripla): "95,33" → registrar com stake_reais 95.33 (odd da tripla segue o print)
+   Total: 3 apostas registradas (não 4).
+
+   Quando a descrição segue essa gramática, ela é a fonte DEFINITIVA de quais apostas foram feitas. Não invente apostas a mais nem a menos.
+
 I. TIPO DE APOSTA — use MATCH SEMÂNTICO com a lista de Tipos de Aposta cadastrados (acima). Use o nome EXATO do cadastro quando reconhecer a intenção. Tipos padrão:
    - "Simples": 1 única seleção
    - "Dupla": 2 seleções combinadas de JOGOS/MERCADOS DIFERENTES, odd única
@@ -307,15 +332,18 @@ K. INDEPENDÊNCIA DOS CAMPOS (CRÍTICO): cada campo é extraído SEPARADAMENTE d
 
 L. EXTRAÇÃO DE EVENTO E MERCADO DIRETO DO PRINT: quando o print mostra claramente os times e o mercado, EXTRAIA. Não deixe null por excesso de cautela.
    - EVENTO: o print sempre mostra os times/participantes. Aceite qualquer separador: "Time A x Time B", "Time A - Time B", "Time A vs Time B", "Time A @ Time B". Todos viram o campo evento. Ex do print "Operário-PR - Fluminense" → evento: "Operário-PR x Fluminense".
-   - MERCADO — MATCH SEMÂNTICO COM LISTA CADASTRADA (importante):
-     * O print pode mostrar o mercado em qualquer idioma (português, inglês, espanhol) e com descrições variadas conforme a casa.
-     * SEMPRE tente fazer MATCH SEMÂNTICO com a lista de Mercados cadastrada (acima). Use o nome EXATO do cadastro quando reconhecer a intenção.
+   - MERCADO — HIERARQUIA DE INFERÊNCIA (prioridade absoluta do topo pro fundo):
+     1) RÓTULO DO MERCADO ESCRITO PELA CASA NO BILHETE (fonte primária, sempre prevalece): é o texto que a casa pinta acima/ao lado da seleção no próprio bilhete de apostas. Exemplos de rótulos da casa: "Jogador a Dar Assistência", "Jogador a Marcar", "Total de Rebotes", "Total de Cartões Mais/Menos", "Resultado Final", "Ambos Marcam", "Handicap Asiático", "Handicap de Rondas", "Mais/Menos Gols", "Qualificar-se", "Partida - Vencedor - 2 Opções".
+     2) DESCRIÇÃO/MÉTODO DO TIPSTER (apenas confirmação): texto tipo "Método: Gol", "Método: Assistência", "Tipo: Cartão" que o tipster coloca junto ao print. Serve para CONFIRMAR o rótulo da casa, nunca para sobrescrever. Se o rótulo da casa diz "Jogador a Dar Assistência" e o tipster diz "Método: Assistência", ambos concordam → Assistências. Se conflitarem (raro), prevalece a casa.
+     3) ASSOCIAÇÃO POR TIPSTER (último recurso): só use se (1) e (2) estiverem indisponíveis. Nunca classifique um mercado só porque "tipster X geralmente posta mercado Y" — o mesmo tipster pode operar mercados diferentes.
+   - MATCH SEMÂNTICO COM LISTA CADASTRADA: após identificar o mercado pela hierarquia acima, faça match semântico com a lista de Mercados cadastrada (pode vir em qualquer idioma — português, inglês, espanhol — e com descrições variadas conforme a casa). Use o nome EXATO do cadastro quando reconhecer a intenção.
      * Exemplos de match semântico:
-       - Print "Marcar a Qualquer Momento" + "Método: Gol" / "Anytime Goalscorer" / "Anytime Scorer" → mercado cadastrado "Anytimes" (se existir)
-       - Print "Match Winner" / "Moneyline" / "Resultado Final" / "Vencedor" → "Resultado Final" (se cadastrado)
-       - Print "Both Teams to Score" / "BTTS" / "Ambos Marcam" → "Ambos Marcam" (se cadastrado)
-       - Print "Over/Under Cards" / "Total de Cartões Mais/Menos" → "Cartões Mais/Menos" ou similar
-       - Print "Handicap de Rondas" / "Round Handicap" / "Map Handicap" → "Handicap de Rondas" (se cadastrado)
+       - Rótulo da casa "Marcar a Qualquer Momento" / "Anytime Goalscorer" / "Anytime Scorer" → mercado cadastrado "Anytimes" (se existir)
+       - Rótulo "Jogador a Dar Assistência" / "Anytime Assist" → "Assistências" (se cadastrado)
+       - Rótulo "Match Winner" / "Moneyline" / "Resultado Final" / "Vencedor" / "Partida - Vencedor" → "Resultado Final" (se cadastrado)
+       - Rótulo "Both Teams to Score" / "BTTS" / "Ambos Marcam" → "Ambos Marcam" (se cadastrado)
+       - Rótulo "Over/Under Cards" / "Total de Cartões Mais/Menos" → "Cartões Mais/Menos" ou similar
+       - Rótulo "Handicap de Rondas" / "Round Handicap" / "Map Handicap" → "Handicap de Rondas" (se cadastrado)
      * Se NENHUM mercado da lista corresponder semanticamente, extraia o texto como aparece no print.
      * Só deixe null se não houver rótulo de mercado identificável no print.
 
