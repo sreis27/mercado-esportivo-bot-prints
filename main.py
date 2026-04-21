@@ -80,6 +80,7 @@ def carregar_cadastros():
         'operadores': sb_get('operadores?select=id,nome'),
         'esportes': sb_get('esportes?select=id,nome'),
         'mercados': sb_get('mercados?select=id,nome'),
+        'tipos_aposta': sb_get('tipos_aposta?select=id,nome'),
         'stakes': sb_get('stakes_historico?select=tipster_id,valor_reais,vigente_a_partir'),
     }
 
@@ -92,6 +93,7 @@ def extrair_aposta(imagem_bytes, descricao_msg, cadastros, data_hoje, operador_m
     operadores_lista = [o['nome'] for o in cadastros['operadores']]
     esportes_lista = [e['nome'] for e in cadastros['esportes']]
     mercados_lista = [m['nome'] for m in cadastros.get('mercados', [])]
+    tipos_aposta_lista = [t['nome'] for t in cadastros.get('tipos_aposta', [])]
 
     prompt = f"""Você é o sistema automatizado de planilhamento do Mercado Esportivo. Opera com julgamento humano.
 
@@ -107,6 +109,7 @@ CADASTROS EXISTENTES — use o nome EXATAMENTE como aparece aqui:
 - Operadores: {json.dumps(operadores_lista, ensure_ascii=False)}
 - Esportes: {json.dumps(esportes_lista, ensure_ascii=False)}
 - Mercados: {json.dumps(mercados_lista, ensure_ascii=False)}
+- Tipos de Aposta: {json.dumps(tipos_aposta_lista, ensure_ascii=False)}
 
 REGRAS IMPORTANTES:
 
@@ -115,6 +118,7 @@ A. OPERADOR: use o nome "{operador_msg}" (quem enviou o print). Se bater com alg
 B. TIPSTER: deduza pelo cabeçalho/título do print. O nome que aparece no cabeçalho pode ser:
    (i) o nome do GRUPO diretamente (ex: "BH Tipster" → "BH CS")
    (ii) um USUÁRIO/APELIDO que assina o print em nome do grupo (ex: "Italo Cards" aparece no print mas o grupo está cadastrado como "Italo Cartões")
+   (iii) o nome ESTILIZADO com separadores decorativos — pontos, traços, espaços entre letras (ex: "P.R.O.P.H.E.T" → "PROPHET", "J D F - V I P" → "JDF-VIP", "S.E.T.T.A" → "SETTA"). NORMALIZE removendo pontos, hífens e espaços extras antes de comparar com a lista.
    Quando houver similaridade temática entre o nome no print e um item da lista (cards ↔ cartões, traduções, abreviações, variações), PRIORIZE o match do cadastro em vez de usar o texto literal do print. Use o nome EXATAMENTE como está na lista de tipsters.
    Se aparecer "GOA", pode ser "GOA TOM", "GOA Fut Fem", "GOA Tradicional" — use o contexto da aposta (esporte, tipo de mercado) pra decidir qual.
 
@@ -148,13 +152,23 @@ D. DATA DO EVENTO — prioridade de fontes (use a primeira disponível):
    4. Nenhum dos anteriores: use HOJE ({data_hoje}) como fallback.
    NUNCA infira data de evento por conhecimento prévio de calendário esportivo — o Claude Vision não tem acesso a dados em tempo real e pode errar. Só use datas que estejam EXPLICITAMENTE escritas no print ou na descrição.
 
+   CUIDADO — IDENTIFICADORES DE GRUPO/TEMPORADA NÃO SÃO DATAS: strings em formato "AAAA.MM [texto]", "T[N]", "Season [N]", "[AAAA].[MM] [nome]" no cabeçalho, logo ou nome do canal do tipster são identificadores de grupo/temporada, NÃO são data do evento. Exemplos:
+   - "2026.03 Courtside" → nome do grupo, NÃO é data 2026-03-XX
+   - "T03 Esports" → temporada 3 do grupo, NÃO é 03/XX/2026
+   - "Season 26.03" → idem
+   Data válida deve estar rotulada ("Data:", "Jogo em:", "Entrada para:", "LIVE") OU aparecer dentro do bilhete em formato inequívoco com dia/mês/ano (ex: "21/04/2026 15:45") ou sendo óbvia a relação com a partida.
+
 E. STAKE (prioridade absoluta: DESCRIÇÃO DO OPERADOR > PRINT):
 
-   CASO 1 — valor vem do PRINT (operador não falou de stake na descrição): preencha stake_unidades com o valor numérico, independente de vir marcado como "u" ou "R$". Tipsters usam ambos os formatos de forma intercambiável pra representar UNIDADES. Exemplos:
+   SINAIS DE UNIDADE EM QUALQUER FONTE (print OU descrição): letra "u" ("2u", "1.5u") e sinal "%" ("0.75%", "1.5%", "2%") são sinais EQUIVALENTES e ambos representam UNIDADES. Aplique em qualquer texto/número que esteja na imagem (bilhete, legenda do tipster, anotações) ou na descrição do operador.
+
+   CASO 1 — valor vem do PRINT (operador não falou de stake na descrição): preencha stake_unidades com o valor numérico. Considere TODO o texto da imagem (bilhete + legenda + anotações do tipster), não só o campo de stake da interface da casa. Exemplos:
    - "2u" → stake_unidades: 2
    - "0.5u" → stake_unidades: 0.5
-   - "R$ 2" no print → stake_unidades: 2 (convenção do tipster, NÃO é dois reais)
-   - "R$ 0,5" no print → stake_unidades: 0.5 (convenção do tipster, NÃO é cinquenta centavos)
+   - "0.75%" escrito abaixo do bilhete → stake_unidades: 0.75
+   - "1% - limite 50" → stake_unidades: 1
+   - "R$ 2" no bilhete da casa → stake_unidades: 2 (convenção do tipster, NÃO é dois reais)
+   - "R$ 0,5" no bilhete da casa → stake_unidades: 0.5 (convenção do tipster, NÃO é cinquenta centavos)
    Nunca faça conversão de moeda neste caso — apenas extraia o número pra stake_unidades.
 
    CASO 2 — operador informou stake na DESCRIÇÃO: a descrição PREVALECE sobre o print. Interprete conforme o operador escreveu, distinguindo unidades de reais pelos sinais:
@@ -182,6 +196,8 @@ E. STAKE (prioridade absoluta: DESCRIÇÃO DO OPERADOR > PRINT):
    Mapeie linha por linha pras apostas correspondentes do print.
 
 F. BOOKIE e CONTAS: vêm da descrição do operador, podem aparecer em qualquer ordem.
+   - ATENÇÃO — BOOKIE DO PRINT ≠ BOOKIE DA APOSTA: quando o print do TIPSTER mostra "LINK:", "Casa:", "Disponível em:", "Código:", ou um link de uma casa (ex: "https://www.bet365.com/..."), isso indica apenas ONDE O TIPSTER ACHOU A ODD, NÃO onde o operador efetivamente apostou. O bookie REAL da aposta SEMPRE vem da descrição do operador. Se a descrição menciona uma casa diferente da do print, a descrição PREVALECE sem exceção.
+     Ex: print do PROPHET mostra "LINK: Superbet" e descrição do operador diz "betfair dany 2.20" → bookie: Betfair, conta: dany. NÃO Superbet.
    - PADRÕES COMUNS: "[bookie] [conta]" (ex: "bet365 luciadritrich", "365 deia") OU "[conta] [bookie]" (ex: "ellian betano", "dany betfair"). Interprete flexível.
    - ABREVIAÇÕES DE BOOKIE conhecidas (lista conservadora, só use quando inequívoco):
      * "365" → Bet365
@@ -193,6 +209,14 @@ F. BOOKIE e CONTAS: vêm da descrição do operador, podem aparecer em qualquer 
 
 F2. ODD REAL NA DESCRIÇÃO: quando a descrição contém explicitamente "odd X.XX" ou "odds X.XX" ou um valor numérico isolado/par de valores que claramente represente odd (ex: "3.80" depois da stake, ou "373,44 1.72" no Formato B onde 1.72 é a odd), esse valor PREVALECE sobre a odd mostrada no print. É a odd real que o operador conseguiu pegar na casa (odds caem em live, por exemplo).
 
+F3. ODD COM BÔNUS DA CASA: quando o print contém marcadores de bônus explícitos, a odd exibida no print está COM o bônus aplicado — NÃO é a odd real da aposta. Marcadores típicos:
+   - "GANHOS AUMENTADOS DE X%"
+   - "BOOST +X%", "ODD BOOSTED", "SUPER ODDS"
+   - "APOSTA TURBINADA", "SUPER AUMENTADA", "AUMENTO DE X%"
+   - Ícones com setas/chamas indicando aumento de odd
+   - Exibição de duas odds lado a lado com seta entre elas (ex: "2.10 >> 3.00" — a odd original 2.10 virou 3.00 com bônus; a REAL da aposta é 2.10 se não houver outra info, ou a odd que o tipster/operador informar na descrição)
+   Regra: quando houver marcador de bônus E a descrição informar uma odd, use a odd da DESCRIÇÃO sem hesitar. Ela representa a odd real (sem bônus) que deve ser registrada.
+
 G. QUANTAS APOSTAS RETORNAR — QUATRO CENÁRIOS (CRÍTICO, fonte comum de erro):
 
    Primeiro, verifique se há MARCADOR EXPLÍCITO DE COMBINADA: o print contém a palavra "DUPLA", "TRIPLA", "MÚLTIPLA", "COMBO", "ACUMULADA", "TRIPLE", "DOUBLE", "ACCUMULATOR" + uma ODD TOTAL calculada + UM ÚNICO valor apostar/valor apostado + UM ÚNICO possível ganho? Se SIM, vá direto pro Cenário 4.
@@ -201,10 +225,22 @@ G. QUANTAS APOSTAS RETORNAR — QUATRO CENÁRIOS (CRÍTICO, fonte comum de erro)
 
    CENÁRIO 1 — Bet Builder / "Criar Aposta" (1 aposta):
    Várias seleções DO MESMO JOGO com UMA ÚNICA odd combinada e UM ÚNICO botão APOSTAR.
-   Ex: Donovan Clingan 15+ pontos + 12+ rebotes + 2+ assistências, odd 28.76, apostar R$ 0,5 → 1 item:
+   IDENTIFICADORES EXPLÍCITOS (quando aparecerem, tipo_aposta = "Criar Aposta" SEM hesitar):
+   - Palavra "CRIAR APOSTA" (em destaque, maiúsculas)
+   - "BET BUILDER"
+   - "ACUMULADOR DO JOGO"
+   - "JOGO DO SEU JEITO"
+   - "MEU BILHETE", "BILHETE DA CASA"
+   - Ícone de construção/lego ao lado do bilhete
+   ENTRADA (CRÍTICO): concatene TODAS as seleções do bet builder separadas por vírgula, NUNCA apenas a primeira.
+   Ex 1: Donovan Clingan 15+ pontos + 12+ rebotes + 2+ assistências, odd 28.76, apostar R$ 0,5 → 1 item:
    - tipo_aposta: "Criar Aposta"
-   - entrada: "Donovan Clingan 15+ pontos, 12+ rebotes, 2+ assistências"
+   - entrada: "Donovan Clingan 15+ pontos, 12+ rebotes, 2+ assistências" (TODAS as 3 seleções)
    - odd: 28.76
+   Ex 2: bilhete POR x SA com 3 seleções (Mais de 221.5 Pontos Total, POR Trail Blazers Mais de 91.5, SA Spurs Mais de 102.5), odd 2.05, apostar R$ 250 → 1 item:
+   - tipo_aposta: "Criar Aposta"
+   - entrada: "Mais de 221.5 Pontos (Total), POR Trail Blazers Mais de 91.5 Pontos, SA Spurs Mais de 102.5 Pontos" (TODAS as 3)
+   - odd: 2.05 (ou a odd real da descrição se houver bônus)
 
    CENÁRIO 2 — Apostas paralelas no mesmo print (N apostas):
    Várias seleções, cada uma com sua ODD INDIVIDUAL visível, possivelmente com uma linha adicional "Dupla/Tripla/Múltipla" mostrando uma odd combinada. Cada odd individual = 1 aposta simples potencial. A odd combinada = 1 aposta adicional.
@@ -252,13 +288,14 @@ H. DESCRIÇÃO = N APOSTAS AUTOSSUFICIENTES (importante complemento ao Cenário 
    - Mapeamento da seleção: se a descrição tem identificador textual ("dupla", "chape", "vitória", "linha KOLESIE +4.5"), use. Se não, mapeie pela odd (linha com odd 1.72 mapeia pra seleção do print cuja odd é 1.72).
    - Se o operador escreveu a linha, é porque há algo diferente do print — NUNCA ignore uma linha da descrição assumindo que é redundante.
 
-I. TIPO DE APOSTA:
+I. TIPO DE APOSTA — use MATCH SEMÂNTICO com a lista de Tipos de Aposta cadastrados (acima). Use o nome EXATO do cadastro quando reconhecer a intenção. Tipos padrão:
    - "Simples": 1 única seleção
    - "Dupla": 2 seleções combinadas de JOGOS/MERCADOS DIFERENTES, odd única
    - "Tripla": 3 seleções combinadas de jogos/mercados diferentes, odd única
    - "Múltipla": 4+ seleções combinadas de jogos/mercados diferentes, odd única
    - "Criar Aposta": bet builder — múltiplas seleções DO MESMO JOGO combinadas pela casa, odd única (ex: jogador X faz pontos + rebotes + assistências no mesmo jogo)
-   Se não der pra inferir, null.
+   Podem existir outros tipos cadastrados (ex: "Super Aumentada", "Aposta Turbinada"). Quando o print mostrar marcador EXPLÍCITO de uma dessas modalidades especiais (ex: faixa "SUPER AUMENTADA", "GANHOS AUMENTADOS", "ODD BOOSTED"), use o tipo correspondente do cadastro se existir. Se o marcador existe mas não há tipo correspondente na lista, use "Criar Aposta" como fallback.
+   Se não der pra inferir de forma alguma, null.
 
 J. CONFIANÇA: se NÃO tiver certeza de algum campo ESPECÍFICO, deixe esse campo como NULL. É melhor null do que errado — o operador confere depois.
 
@@ -295,7 +332,7 @@ FORMATO DE RESPOSTA (JSON puro, sem markdown):
       "odd": number ou null,
       "stake_unidades": number ou null,
       "stake_reais": number ou null,
-      "tipo_aposta": "Simples|Dupla|Tripla|Múltipla|Criar Aposta" ou null,
+      "tipo_aposta": "nome igual ao cadastro (Simples|Dupla|Tripla|Múltipla|Criar Aposta|Super Aumentada|outros)" ou null,
       "tipster": "nome igual ao cadastro" ou null,
       "operador": "nome igual ao cadastro" ou null,
       "bookie": "nome igual ao cadastro" ou null,
@@ -419,9 +456,14 @@ def processar_mensagem(msg, cadastros):
             return
 
         data_hoje = datetime.now(BRT).strftime('%Y-%m-%d')
-        # Nome de quem enviou o print (operador)
+        # Nome de quem enviou o print (operador) — mapeia pela INICIAL do first_name
+        # S = Samuel, A = Amaral, D = Diego
         from_user = msg.get('from') or {}
-        operador_nome = from_user.get('first_name') or from_user.get('username') or ''
+        fname = (from_user.get('first_name') or from_user.get('username') or '').strip()
+        inicial = fname[:1].upper() if fname else ''
+        mapa_operador = {'S': 'Samuel', 'A': 'Amaral', 'D': 'Diego'}
+        operador_nome = mapa_operador.get(inicial, fname)
+        print(f"  👤 from='{fname}' → inicial='{inicial}' → operador='{operador_nome}'")
         resultado = extrair_aposta(img_bytes, texto, cadastros, data_hoje, operador_nome)
 
         apostas = resultado.get('apostas', [])
