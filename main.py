@@ -111,12 +111,18 @@ A. OPERADOR: use o nome "{operador_msg}" (quem enviou o print). Se bater com alg
 
 B. TIPSTER: deduza pelo cabeçalho/título do print. Se aparecer "BH Tipster", provavelmente é "BH CS". Se aparecer "GOA", pode ser "GOA TOM", "GOA Fut Fem", "GOA Tradicional" (use contexto da aposta pra decidir qual). Correlacione com a lista de tipsters.
 
-C. ESPORTE: INFIRA pelo contexto — nome dos times, torneio, tipo de mercado. Exemplos:
-   - "1W x GenOne" + "Handicap de rondas" → Counter-Strike
-   - "Nice x Le Havre" → Futebol
-   - "Lakers x Warriors" → Basquete
-   - Se ver "Mapa 3", "rondas", "kills" → Counter-Strike/Esports
-   Use o nome do esporte EXATAMENTE como aparece no cadastro.
+C. ESPORTE: INFIRA pelo contexto usando seu CONHECIMENTO de times, ligas e jogadores famosos. Não deixe null se houver qualquer nome reconhecível — use o que você sabe. Exemplos:
+   - "Portland Trail Blazers", "San Antonio Spurs", "Lakers", "Warriors", "Celtics" → Basquete (NBA)
+   - "Real Madrid", "Barcelona", "Arsenal", "Liverpool", "Palmeiras", "Flamengo", "PSG", "Bayern" → Futebol
+   - "1W", "GenOne", "FaZe", "NAVI", "G2", "Vitality" → Counter-Strike (Esports)
+   - "Djokovic", "Alcaraz", "Sinner", "Sabalenka" → Tênis
+   - "McLaren", "Ferrari", "Verstappen", "Hamilton" → Fórmula 1
+   Sinais do tipo de mercado também ajudam:
+   - "pontos", "rebotes", "assistências", "bloqueios" → Basquete
+   - "gols", "escanteios", "cartões", "ambos marcam" → Futebol
+   - "Mapa 3", "rondas", "kills", "headshots" → Counter-Strike/Esports
+   - "sets", "games", "aces" → Tênis
+   Só deixe null se REALMENTE não reconhecer nada. Use o nome do esporte EXATAMENTE como aparece no cadastro.
 
 D. DATA DO EVENTO: se o print diz "LIVE" ou "AO VIVO", é HOJE. Se você reconhece os times e sabe que há uma partida marcada entre eles numa data específica, use essa data. Se não, use HOJE ({data_hoje}).
 
@@ -124,9 +130,31 @@ E. STAKE: o print normalmente mostra em unidades (ex: "2u", "1u", "0.5u"). Se mo
 
 F. BOOKIE e CONTAS: vêm da descrição do operador. Ex: "bet365 luciadritrich" → bookie: Bet365, contas: luciadritrich. Se a casa só aparece sozinha sem conta, apenas informe o bookie.
 
-G. MÚLTIPLAS APOSTAS: se o print contém vários bilhetes independentes (ex: duas entradas separadas), retorne múltiplos itens. Se é UMA aposta (mesmo múltipla combinada dentro de 1 bilhete), retorne 1 item com tipo_aposta correto.
+G. MÚLTIPLAS APOSTAS vs CRIAR APOSTA (CRÍTICO — fonte comum de erro):
+   Antes de decidir quantos itens retornar, CONTE no print:
+   - Quantas odds/cotações distintas aparecem?
+   - Quantos botões/valores APOSTAR aparecem?
 
-H. TIPO DE APOSTA: "Simples" (1 seleção), "Dupla" (2), "Tripla" (3), "Múltipla" (4+), "Criar Aposta" (bet builder da casa). Se não der pra inferir, null.
+   Regra:
+   - UMA odd + UM valor APOSTAR = 1 aposta ÚNICA, mesmo que tenha várias seleções listadas. Retorne 1 item só.
+   - MÚLTIPLAS odds + MÚLTIPLOS valores APOSTAR = apostas independentes. Retorne um item por aposta.
+
+   Exemplo típico que causa confusão ("Criar Aposta" / bet builder):
+   Print mostra 4 seleções do mesmo jogador (Donovan Clingan: 15+ pontos, 12+ rebotes, 2+ assistências, 2+ bloqueios) + UMA cotação combinada 28.76 + UM botão "APOSTAR R$0,50" = 1 item só:
+   - tipo_aposta: "Criar Aposta"
+   - entrada: "Donovan Clingan 15+ pontos, 12+ rebotes, 2+ assistências, 2+ bloqueios" (concatena as seleções separadas por vírgula)
+   - odd: 28.76 (a cotação combinada)
+   - stake_unidades: conforme descrição do operador
+
+   NUNCA divida um bet builder em múltiplas apostas. Se a odd é única, é 1 aposta.
+
+H. TIPO DE APOSTA:
+   - "Simples": 1 única seleção
+   - "Dupla": 2 seleções combinadas de JOGOS/MERCADOS DIFERENTES, odd única
+   - "Tripla": 3 seleções combinadas de jogos/mercados diferentes, odd única
+   - "Múltipla": 4+ seleções combinadas de jogos/mercados diferentes, odd única
+   - "Criar Aposta": bet builder — múltiplas seleções DO MESMO JOGO combinadas pela casa, odd única (ex: jogador X faz pontos + rebotes + assistências no mesmo jogo)
+   Se não der pra inferir, null.
 
 I. CONFIANÇA: se NÃO tiver certeza de algum campo, deixe NULL. É melhor null do que errado — o operador confere depois.
 
