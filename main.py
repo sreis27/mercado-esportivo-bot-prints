@@ -136,32 +136,52 @@ E. STAKE (prioridade absoluta: DESCRIÇÃO DO OPERADOR > PRINT):
    Nunca faça conversão de moeda neste caso — apenas extraia o número pra stake_unidades.
 
    CASO 2 — operador informou stake na DESCRIÇÃO: a descrição PREVALECE sobre o print. Interprete conforme o operador escreveu, distinguindo unidades de reais pelos sinais:
-   - SINAIS DE UNIDADES → preencher stake_unidades: letra "u" no valor ("1u", "1.5u"), valores baixos típicos (0.5, 1, 2, 3, 5).
-     Exemplos: "apostei 1u" → stake_unidades: 1 / "2u total" → stake_unidades: 2
-   - SINAIS DE REAIS → preencher stake_reais: palavras "total", "R$", "reais", "em reais", ou valores altos sem "u" (ex: 400, 1000, 250).
+   - SINAIS DE UNIDADES → preencher stake_unidades: letra "u" no valor ("1u", "1.5u"), sinal "%" no valor ("0.50%" = 0.5u, "1%" = 1u, "2%" = 2u — "%" é sinônimo de unidade em alguns tipsters), valores baixos típicos (0.5, 1, 2, 3, 5).
+     Exemplos: "apostei 1u" → stake_unidades: 1 / "2u total" → stake_unidades: 2 / "0.50%" → stake_unidades: 0.5
+   - SINAIS DE REAIS → preencher stake_reais: palavras "total", "R$", "reais", "em reais", ou valores altos sem "u" nem "%" (ex: 400, 1000, 250).
      Exemplos: "400,00 total" → stake_reais: 400 / "apostei R$ 250" → stake_reais: 250 / "1000 em reais" → stake_reais: 1000
    - Preencha APENAS UM dos dois campos (stake_unidades OU stake_reais), nunca os dois ao mesmo tempo.
    - Em caso de ambiguidade real, prefira stake_unidades.
+   
+   IMPORTANTE — descrição com MÚLTIPLAS LINHAS de stake: se o operador mandar várias linhas, cada linha geralmente corresponde a UMA aposta diferente. Ex:
+   "0.50%     (linha 1 → stake da aposta 1)
+    0.50%     (linha 2 → stake da aposta 2)
+    0.10% @39.48   (linha 3 → stake da aposta 3, a @odd identifica qual aposta)"
+   Mapeie linha por linha pras apostas correspondentes do print.
 
 F. BOOKIE e CONTAS: vêm da descrição do operador. Ex: "bet365 luciadritrich" → bookie: Bet365, contas: luciadritrich. Se a casa só aparece sozinha sem conta, apenas informe o bookie.
 
-G. MÚLTIPLAS APOSTAS vs CRIAR APOSTA (CRÍTICO — fonte comum de erro):
-   Antes de decidir quantos itens retornar, CONTE no print:
-   - Quantas odds/cotações distintas aparecem?
-   - Quantos botões/valores APOSTAR aparecem?
+G. QUANTAS APOSTAS RETORNAR — TRÊS CENÁRIOS (CRÍTICO, fonte comum de erro):
 
-   Regra:
-   - UMA odd + UM valor APOSTAR = 1 aposta ÚNICA, mesmo que tenha várias seleções listadas. Retorne 1 item só.
-   - MÚLTIPLAS odds + MÚLTIPLOS valores APOSTAR = apostas independentes. Retorne um item por aposta.
+   Primeiro, CONTE no print: quantas odds DISTINTAS aparecem? Cada odd é uma potencial aposta.
 
-   Exemplo típico que causa confusão ("Criar Aposta" / bet builder):
-   Print mostra 4 seleções do mesmo jogador (Donovan Clingan: 15+ pontos, 12+ rebotes, 2+ assistências, 2+ bloqueios) + UMA cotação combinada 28.76 + UM botão "APOSTAR R$0,50" = 1 item só:
+   CENÁRIO 1 — Bet Builder / "Criar Aposta" (1 aposta):
+   Várias seleções DO MESMO JOGO com UMA ÚNICA odd combinada e UM ÚNICO botão APOSTAR.
+   Ex: Donovan Clingan 15+ pontos + 12+ rebotes + 2+ assistências, odd 28.76, apostar R$ 0,5 → 1 item:
    - tipo_aposta: "Criar Aposta"
-   - entrada: "Donovan Clingan 15+ pontos, 12+ rebotes, 2+ assistências, 2+ bloqueios" (concatena as seleções separadas por vírgula)
-   - odd: 28.76 (a cotação combinada)
-   - stake_unidades: conforme descrição do operador
+   - entrada: "Donovan Clingan 15+ pontos, 12+ rebotes, 2+ assistências"
+   - odd: 28.76
 
-   NUNCA divida um bet builder em múltiplas apostas. Se a odd é única, é 1 aposta.
+   CENÁRIO 2 — Apostas paralelas no mesmo print (N apostas):
+   Várias seleções, cada uma com sua ODD INDIVIDUAL visível, possivelmente com uma linha adicional "Dupla/Tripla/Múltipla" mostrando uma odd combinada. Cada odd individual = 1 aposta simples potencial. A odd combinada = 1 aposta adicional.
+   A DESCRIÇÃO DO OPERADOR determina quais apostas foram efetivamente realizadas (tipicamente todas).
+
+   Ex: Print mostra:
+   - Vitória (F) — odd 9.75
+   - Chapecoense — odd 4.05
+   - Dupla = 1 — odd 39.48
+   Descrição: "0.50% / 0.50% / 0.10% @39.48 / dupla ellian / chape ellian / vitória ellian"
+   → Retornar 3 apostas:
+     1. tipo_aposta: "Simples", entrada: "Vitória (F)", odd: 9.75, stake_unidades: 0.5, contas_utilizadas: "ellian"
+     2. tipo_aposta: "Simples", entrada: "Chapecoense", odd: 4.05, stake_unidades: 0.5, contas_utilizadas: "ellian"
+     3. tipo_aposta: "Dupla", entrada: "Vitória (F) + Chapecoense", odd: 39.48, stake_unidades: 0.1, contas_utilizadas: "ellian"
+
+   Use pistas da descrição pra mapear: "@39.48" identifica a aposta pela odd, "dupla" identifica tipo, nomes mencionados ("chape", "vitória") identificam qual seleção.
+
+   CENÁRIO 3 — Aposta única simples (1 aposta):
+   Uma seleção, uma odd, um valor apostar. Retorne 1 item.
+
+   REGRA-CHAVE: UMA odd combinada cobrindo várias seleções = Cenário 1 (1 item). MÚLTIPLAS odds individuais (com ou sem combinada adicional) = Cenário 2 (N itens, mapeados pela descrição).
 
 H. TIPO DE APOSTA:
    - "Simples": 1 única seleção
