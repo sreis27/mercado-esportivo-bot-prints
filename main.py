@@ -79,6 +79,7 @@ def carregar_cadastros():
         'bookies': sb_get('bookies?select=id,nome'),
         'operadores': sb_get('operadores?select=id,nome'),
         'esportes': sb_get('esportes?select=id,nome'),
+        'mercados': sb_get('mercados?select=id,nome'),
         'stakes': sb_get('stakes_historico?select=tipster_id,valor_reais,vigente_a_partir'),
     }
 
@@ -90,6 +91,7 @@ def extrair_aposta(imagem_bytes, descricao_msg, cadastros, data_hoje, operador_m
     bookies_lista = [b['nome'] for b in cadastros['bookies']]
     operadores_lista = [o['nome'] for o in cadastros['operadores']]
     esportes_lista = [e['nome'] for e in cadastros['esportes']]
+    mercados_lista = [m['nome'] for m in cadastros.get('mercados', [])]
 
     prompt = f"""Você é o sistema automatizado de planilhamento do Mercado Esportivo. Opera com julgamento humano.
 
@@ -104,27 +106,47 @@ CADASTROS EXISTENTES — use o nome EXATAMENTE como aparece aqui:
 - Bookies: {json.dumps(bookies_lista, ensure_ascii=False)}
 - Operadores: {json.dumps(operadores_lista, ensure_ascii=False)}
 - Esportes: {json.dumps(esportes_lista, ensure_ascii=False)}
+- Mercados: {json.dumps(mercados_lista, ensure_ascii=False)}
 
 REGRAS IMPORTANTES:
 
 A. OPERADOR: use o nome "{operador_msg}" (quem enviou o print). Se bater com algum nome da lista de operadores, use o nome exato do cadastro. Se não bater, deixe como está.
 
-B. TIPSTER: deduza pelo cabeçalho/título do print. Se aparecer "BH Tipster", provavelmente é "BH CS". Se aparecer "GOA", pode ser "GOA TOM", "GOA Fut Fem", "GOA Tradicional" (use contexto da aposta pra decidir qual). Correlacione com a lista de tipsters.
+B. TIPSTER: deduza pelo cabeçalho/título do print. O nome que aparece no cabeçalho pode ser:
+   (i) o nome do GRUPO diretamente (ex: "BH Tipster" → "BH CS")
+   (ii) um USUÁRIO/APELIDO que assina o print em nome do grupo (ex: "Italo Cards" aparece no print mas o grupo está cadastrado como "Italo Cartões")
+   Quando houver similaridade temática entre o nome no print e um item da lista (cards ↔ cartões, traduções, abreviações, variações), PRIORIZE o match do cadastro em vez de usar o texto literal do print. Use o nome EXATAMENTE como está na lista de tipsters.
+   Se aparecer "GOA", pode ser "GOA TOM", "GOA Fut Fem", "GOA Tradicional" — use o contexto da aposta (esporte, tipo de mercado) pra decidir qual.
 
-C. ESPORTE: INFIRA pelo contexto usando seu CONHECIMENTO de times, ligas e jogadores famosos. Não deixe null se houver qualquer nome reconhecível — use o que você sabe. Exemplos:
-   - "Portland Trail Blazers", "San Antonio Spurs", "Lakers", "Warriors", "Celtics" → Basquete (NBA)
-   - "Real Madrid", "Barcelona", "Arsenal", "Liverpool", "Palmeiras", "Flamengo", "PSG", "Bayern" → Futebol
-   - "1W", "GenOne", "FaZe", "NAVI", "G2", "Vitality" → Counter-Strike (Esports)
-   - "Djokovic", "Alcaraz", "Sinner", "Sabalenka" → Tênis
-   - "McLaren", "Ferrari", "Verstappen", "Hamilton" → Fórmula 1
-   Sinais do tipo de mercado também ajudam:
-   - "pontos", "rebotes", "assistências", "bloqueios" → Basquete
-   - "gols", "escanteios", "cartões", "ambos marcam" → Futebol
-   - "Mapa 3", "rondas", "kills", "headshots" → Counter-Strike/Esports
-   - "sets", "games", "aces" → Tênis
-   Só deixe null se REALMENTE não reconhecer nada. Use o nome do esporte EXATAMENTE como aparece no cadastro.
+C. ESPORTE: INFIRA por COMBINAÇÃO DE SINAIS (nome de time + mercado + torneio + contexto). NUNCA decida esporte baseado apenas em um nome de time, porque nomes são ambíguos:
+   - "Fluminense" pode ser futebol, vôlei, basquete — precisa mercado ou contexto pra decidir
+   - "Flamengo" pode ser futebol ou basquete — idem
+   - "Barça eSports" existe em LOL, CS, Valorant, etc — precisa termo específico do jogo
+   Só infira esporte quando houver PELO MENOS 2 SINAIS CONVERGENTES. Se houver só um nome isolado sem mais pistas, deixe null.
 
-D. DATA DO EVENTO: se o print diz "LIVE" ou "AO VIVO", é HOJE. Se você reconhece os times e sabe que há uma partida marcada entre eles numa data específica, use essa data. Se não, use HOJE ({data_hoje}).
+   SINAIS DE MERCADO que identificam o esporte:
+   - Futebol: "gols", "escanteios", "cartões" (Mais/Menos de X.5), "ambos marcam", "anytime goalscorer", "marcar a qualquer momento", "qualificar-se", "resultado final" em contexto de clube
+   - Basquete: "pontos", "rebotes", "assistências", "bloqueios" (do jogador), "pontos totais do jogo"
+   - Counter-Strike (CS): "Mapa 1/2/3", "rondas" (ou "rodada"), "kills", "CT/TR", "pistol round", "handicap de rondas"
+   - League of Legends (LOL): "barão", "dragão", "nashor", "torres", "inibidores", "first blood", "first lane"
+   - DOTA 2: "roshan", "rax", "creep score", "first blood" em contexto DOTA
+   - Valorant: "agentes" específicos (Jett, Omen, Phoenix), "plant", "defuse" sem contexto CS
+   - Tênis: "sets", "games", "aces", "break points"
+   - F1/Automobilismo: "volta mais rápida", "pole", "podium"
+   - Os esports citados são os mais comuns mas NÃO são lista fechada — se identificar outro (Rocket League, KoF, etc), use o nome correto.
+
+   SINAIS DE TORNEIO/LIGA também ajudam: "Champions League", "Premier League", "NBA", "LEC", "LPL", "CBLOL", "Major CS", etc.
+
+   REGRA FINAL: se houver mercado genérico ("Match Winner", "Moneyline", "Vencedor 2-Way") SEM outro sinal que identifique o esporte, deixe null. É melhor null do que chutar.
+
+   Use o nome do esporte EXATAMENTE como aparece no cadastro.
+
+D. DATA DO EVENTO — prioridade de fontes (use a primeira disponível):
+   1. DATA EXPLÍCITA NO PRINT: se o print mostra a data em qualquer formato ("21/04/2026", "21 abr", "Data: 2026-04-21 15:45:00", "Entrada para 21/04/2026"), extraia essa data como YYYY-MM-DD.
+   2. DATA EXPLÍCITA NA DESCRIÇÃO: se o operador escreveu uma data na descrição, use essa.
+   3. "LIVE" ou "AO VIVO" no print: a partida é HOJE ({data_hoje}).
+   4. Nenhum dos anteriores: use HOJE ({data_hoje}) como fallback.
+   NUNCA infira data de evento por conhecimento prévio de calendário esportivo — o Claude Vision não tem acesso a dados em tempo real e pode errar. Só use datas que estejam EXPLICITAMENTE escritas no print ou na descrição.
 
 E. STAKE (prioridade absoluta: DESCRIÇÃO DO OPERADOR > PRINT):
 
@@ -143,17 +165,39 @@ E. STAKE (prioridade absoluta: DESCRIÇÃO DO OPERADOR > PRINT):
    - Preencha APENAS UM dos dois campos (stake_unidades OU stake_reais), nunca os dois ao mesmo tempo.
    - Em caso de ambiguidade real, prefira stake_unidades.
    
-   IMPORTANTE — descrição com MÚLTIPLAS LINHAS de stake: se o operador mandar várias linhas, cada linha geralmente corresponde a UMA aposta diferente. Ex:
+   IMPORTANTE — descrição com MÚLTIPLAS LINHAS de stake: se o operador mandar várias linhas, cada linha (ou par de linhas) geralmente corresponde a UMA aposta diferente. Exemplos:
+
+   FORMATO A — uma linha por aposta (stake e identificador juntos):
    "0.50%     (linha 1 → stake da aposta 1)
     0.50%     (linha 2 → stake da aposta 2)
     0.10% @39.48   (linha 3 → stake da aposta 3, a @odd identifica qual aposta)"
+
+   FORMATO B — par de linhas por aposta (conta/bookie + stake/odd):
+   "gabi betano     (linha 1 → identifica aposta 1: conta 'gabi' na Betano)
+    487,35 1.90    (linha 2 → stake_reais: 487.35, odd de confirmação: 1.90)
+    mcgames        (linha 3 → identifica aposta 2: bookie MCGames)
+    312,65 1.85"   (linha 4 → stake_reais: 312.65, odd: 1.85)
+   → 2 apostas: aposta 1 (Betano, gabi, stake_reais 487.35, odd 1.90) e aposta 2 (MCGames, stake_reais 312.65, odd 1.85). Valores altos como 487.35 e 312.65 SÃO REAIS, não unidades — preencha stake_reais.
+
    Mapeie linha por linha pras apostas correspondentes do print.
 
-F. BOOKIE e CONTAS: vêm da descrição do operador. Ex: "bet365 luciadritrich" → bookie: Bet365, contas: luciadritrich. Se a casa só aparece sozinha sem conta, apenas informe o bookie.
+F. BOOKIE e CONTAS: vêm da descrição do operador, podem aparecer em qualquer ordem.
+   - PADRÕES COMUNS: "[bookie] [conta]" (ex: "bet365 luciadritrich", "365 deia") OU "[conta] [bookie]" (ex: "ellian betano", "dany betfair"). Interprete flexível.
+   - ABREVIAÇÕES DE BOOKIE conhecidas (lista conservadora, só use quando inequívoco):
+     * "365" → Bet365
+     * "AG" → Aposta Ganha
+     Outras abreviações genéricas (ex: "bet", "bra") são ambíguas e NÃO devem ser expandidas — se a descrição usa abreviação ambígua, deixe bookie null.
+   - NOTAÇÃO `[conta]+N`: significa "conta X + N outras contas" (ex: "ellian+1" = conta ellian + 1 outra; "dany+2" = dany + 2 outras). PRESERVE LITERAL no campo contas_utilizadas como veio ("ellian+1"), não tente expandir.
+   - Se a casa só aparece sozinha sem conta, preencha bookie e deixe contas null.
+   - Se só aparece a conta sem bookie, preencha contas e deixe bookie null.
 
-G. QUANTAS APOSTAS RETORNAR — TRÊS CENÁRIOS (CRÍTICO, fonte comum de erro):
+F2. ODD REAL NA DESCRIÇÃO: quando a descrição contém explicitamente "odd X.XX" ou "odds X.XX" ou um valor numérico isolado/par de valores que claramente represente odd (ex: "3.80" depois da stake, ou "373,44 1.72" no Formato B onde 1.72 é a odd), esse valor PREVALECE sobre a odd mostrada no print. É a odd real que o operador conseguiu pegar na casa (odds caem em live, por exemplo).
 
-   Primeiro, CONTE no print: quantas odds DISTINTAS aparecem? Cada odd é uma potencial aposta.
+G. QUANTAS APOSTAS RETORNAR — QUATRO CENÁRIOS (CRÍTICO, fonte comum de erro):
+
+   Primeiro, verifique se há MARCADOR EXPLÍCITO DE COMBINADA: o print contém a palavra "DUPLA", "TRIPLA", "MÚLTIPLA", "COMBO", "ACUMULADA", "TRIPLE", "DOUBLE", "ACCUMULATOR" + uma ODD TOTAL calculada + UM ÚNICO valor apostar/valor apostado + UM ÚNICO possível ganho? Se SIM, vá direto pro Cenário 4.
+
+   Caso contrário, CONTE no print: quantas odds DISTINTAS aparecem? Cada odd é uma potencial aposta.
 
    CENÁRIO 1 — Bet Builder / "Criar Aposta" (1 aposta):
    Várias seleções DO MESMO JOGO com UMA ÚNICA odd combinada e UM ÚNICO botão APOSTAR.
@@ -174,16 +218,41 @@ G. QUANTAS APOSTAS RETORNAR — TRÊS CENÁRIOS (CRÍTICO, fonte comum de erro):
    → Retornar 3 apostas:
      1. tipo_aposta: "Simples", entrada: "Vitória (F)", odd: 9.75, stake_unidades: 0.5, contas_utilizadas: "ellian"
      2. tipo_aposta: "Simples", entrada: "Chapecoense", odd: 4.05, stake_unidades: 0.5, contas_utilizadas: "ellian"
-     3. tipo_aposta: "Dupla", entrada: "Vitória (F) + Chapecoense", odd: 39.48, stake_unidades: 0.1, contas_utilizadas: "ellian"
+     3. tipo_aposta: "Dupla", evento: "Dupla", entrada: "Vitória (F) + Chapecoense", odd: 39.48, stake_unidades: 0.1, contas_utilizadas: "ellian"
 
    Use pistas da descrição pra mapear: "@39.48" identifica a aposta pela odd, "dupla" identifica tipo, nomes mencionados ("chape", "vitória") identificam qual seleção.
 
    CENÁRIO 3 — Aposta única simples (1 aposta):
    Uma seleção, uma odd, um valor apostar. Retorne 1 item.
 
-   REGRA-CHAVE: UMA odd combinada cobrindo várias seleções = Cenário 1 (1 item). MÚLTIPLAS odds individuais (com ou sem combinada adicional) = Cenário 2 (N itens, mapeados pela descrição).
+   CENÁRIO 4 — Combinada explícita da casa (1 aposta única):
+   O print mostra MÚLTIPLAS seleções com odds individuais visíveis, MAS há sinais claros de que é UMA única aposta combinada:
+   - Palavra explícita "TRIPLA", "DUPLA", "MÚLTIPLA", "COMBO", "ACUMULADA" no print
+   - Uma ODD TOTAL/COMBINADA calculada (ex: "Odd total 15.10")
+   - UM ÚNICO valor apostado (ex: "Valor apostado 0.50")
+   - UM ÚNICO possível ganho/retorno
+   Nesse caso as odds individuais são só INFORMATIVAS (mostrando como a combinada foi calculada) — NÃO representam apostas separadas. Retorne 1 item único:
+   - tipo_aposta: "Tripla" (ou Dupla/Múltipla conforme número de seleções)
+   - evento: apenas "Tripla" (ou "Dupla"/"Múltipla") — NÃO concatenar os eventos dos jogos
+   - entrada: concatenar as seleções separadas por " + " (ex: "RC Lens - Toulouse Menos de 1.5 + Girona - Betis Mais de 0.5 + Brighton - Chelsea Mais de 2.5")
+   - mercado: null (mercados diferentes)
+   - esporte: se todos os jogos são do mesmo esporte, preencher; se mistos, null
+   - odd: a odd total (15.10)
+   - stake: o único valor do bilhete
 
-H. TIPO DE APOSTA:
+   Ex: Print com 3 seleções de futebol, odd total 15.10, 0.50u apostado → 1 item:
+   {{"tipo_aposta": "Tripla", "evento": "Tripla", "entrada": "RC Lens - Toulouse Menos de 1.5 + Girona - Betis Mais de 0.5 + Brighton - Chelsea Mais de 2.5", "odd": 15.10, "stake_unidades": 0.5, "esporte": "Futebol", "mercado": null}}
+
+   REGRA-CHAVE: marcador explícito de combinada + odd total + valor único = Cenário 4 (1 item). Múltiplas odds sem marcador de combinada = Cenário 2 (N itens mapeados pela descrição). Bet builder do mesmo jogo = Cenário 1.
+
+H. DESCRIÇÃO = N APOSTAS AUTOSSUFICIENTES (importante complemento ao Cenário 2):
+   Quando a descrição contém várias linhas, cada linha representa UMA aposta que se diferencia do bilhete visual em algum aspecto (casa diferente, stake diferente, odd real pega, conta diferente). O número de apostas registradas deve bater com o número de LINHAS ÚTEIS da descrição, não com o número de odds do print.
+   - Campos INFORMADOS na linha → usar os valores da descrição
+   - Campos OMISSOS na linha → herdar do print (seleção, mercado, evento, esporte, etc.)
+   - Mapeamento da seleção: se a descrição tem identificador textual ("dupla", "chape", "vitória", "linha KOLESIE +4.5"), use. Se não, mapeie pela odd (linha com odd 1.72 mapeia pra seleção do print cuja odd é 1.72).
+   - Se o operador escreveu a linha, é porque há algo diferente do print — NUNCA ignore uma linha da descrição assumindo que é redundante.
+
+I. TIPO DE APOSTA:
    - "Simples": 1 única seleção
    - "Dupla": 2 seleções combinadas de JOGOS/MERCADOS DIFERENTES, odd única
    - "Tripla": 3 seleções combinadas de jogos/mercados diferentes, odd única
@@ -191,13 +260,27 @@ H. TIPO DE APOSTA:
    - "Criar Aposta": bet builder — múltiplas seleções DO MESMO JOGO combinadas pela casa, odd única (ex: jogador X faz pontos + rebotes + assistências no mesmo jogo)
    Se não der pra inferir, null.
 
-I. CONFIANÇA: se NÃO tiver certeza de algum campo ESPECÍFICO, deixe esse campo como NULL. É melhor null do que errado — o operador confere depois.
+J. CONFIANÇA: se NÃO tiver certeza de algum campo ESPECÍFICO, deixe esse campo como NULL. É melhor null do que errado — o operador confere depois.
 
-J. INDEPENDÊNCIA DOS CAMPOS (CRÍTICO): cada campo é extraído SEPARADAMENTE dos outros. Incerteza, impasse ou dificuldade em UM campo NUNCA deve fazer outros campos virarem null por tabela. Exemplos:
+K. INDEPENDÊNCIA DOS CAMPOS (CRÍTICO): cada campo é extraído SEPARADAMENTE dos outros. Incerteza, impasse ou dificuldade em UM campo NUNCA deve fazer outros campos virarem null por tabela. Exemplos:
    - Se a odd 33.48 está claramente visível, registre 33.48 — mesmo que você tenha dúvida sobre stake, mercado ou qualquer outro campo.
    - Se o tipster está claro no cabeçalho, registre o tipster — mesmo que tenha dúvida sobre a data do evento.
    - Se você conseguiu identificar o evento e o esporte, registre — mesmo que não tenha certeza do tipo de aposta.
    NUNCA "desista" de um bilhete inteiro por causa de um campo duvidoso. Extraia TUDO que você consegue, e deixa null SÓ os campos em que você realmente não tem certeza.
+
+L. EXTRAÇÃO DE EVENTO E MERCADO DIRETO DO PRINT: quando o print mostra claramente os times e o mercado, EXTRAIA. Não deixe null por excesso de cautela.
+   - EVENTO: o print sempre mostra os times/participantes. Aceite qualquer separador: "Time A x Time B", "Time A - Time B", "Time A vs Time B", "Time A @ Time B". Todos viram o campo evento. Ex do print "Operário-PR - Fluminense" → evento: "Operário-PR x Fluminense".
+   - MERCADO — MATCH SEMÂNTICO COM LISTA CADASTRADA (importante):
+     * O print pode mostrar o mercado em qualquer idioma (português, inglês, espanhol) e com descrições variadas conforme a casa.
+     * SEMPRE tente fazer MATCH SEMÂNTICO com a lista de Mercados cadastrada (acima). Use o nome EXATO do cadastro quando reconhecer a intenção.
+     * Exemplos de match semântico:
+       - Print "Marcar a Qualquer Momento" + "Método: Gol" / "Anytime Goalscorer" / "Anytime Scorer" → mercado cadastrado "Anytimes" (se existir)
+       - Print "Match Winner" / "Moneyline" / "Resultado Final" / "Vencedor" → "Resultado Final" (se cadastrado)
+       - Print "Both Teams to Score" / "BTTS" / "Ambos Marcam" → "Ambos Marcam" (se cadastrado)
+       - Print "Over/Under Cards" / "Total de Cartões Mais/Menos" → "Cartões Mais/Menos" ou similar
+       - Print "Handicap de Rondas" / "Round Handicap" / "Map Handicap" → "Handicap de Rondas" (se cadastrado)
+     * Se NENHUM mercado da lista corresponder semanticamente, extraia o texto como aparece no print.
+     * Só deixe null se não houver rótulo de mercado identificável no print.
 
 FORMATO DE RESPOSTA (JSON puro, sem markdown):
 
