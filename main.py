@@ -126,7 +126,22 @@ C. ESPORTE: INFIRA pelo contexto usando seu CONHECIMENTO de times, ligas e jogad
 
 D. DATA DO EVENTO: se o print diz "LIVE" ou "AO VIVO", é HOJE. Se você reconhece os times e sabe que há uma partida marcada entre eles numa data específica, use essa data. Se não, use HOJE ({data_hoje}).
 
-E. STAKE: o print normalmente mostra em unidades (ex: "2u", "1u", "0.5u"). Se mostrar R$, use o valor direto e deixe pro dashboard converter. Se a descrição do operador contradizer o print (ex: print diz 2u mas operador escreveu "apostei 1u"), use o da descrição.
+E. STAKE (prioridade absoluta: DESCRIÇÃO DO OPERADOR > PRINT):
+
+   CASO 1 — valor vem do PRINT (operador não falou de stake na descrição): preencha stake_unidades com o valor numérico, independente de vir marcado como "u" ou "R$". Tipsters usam ambos os formatos de forma intercambiável pra representar UNIDADES. Exemplos:
+   - "2u" → stake_unidades: 2
+   - "0.5u" → stake_unidades: 0.5
+   - "R$ 2" no print → stake_unidades: 2 (convenção do tipster, NÃO é dois reais)
+   - "R$ 0,5" no print → stake_unidades: 0.5 (convenção do tipster, NÃO é cinquenta centavos)
+   Nunca faça conversão de moeda neste caso — apenas extraia o número pra stake_unidades.
+
+   CASO 2 — operador informou stake na DESCRIÇÃO: a descrição PREVALECE sobre o print. Interprete conforme o operador escreveu, distinguindo unidades de reais pelos sinais:
+   - SINAIS DE UNIDADES → preencher stake_unidades: letra "u" no valor ("1u", "1.5u"), valores baixos típicos (0.5, 1, 2, 3, 5).
+     Exemplos: "apostei 1u" → stake_unidades: 1 / "2u total" → stake_unidades: 2
+   - SINAIS DE REAIS → preencher stake_reais: palavras "total", "R$", "reais", "em reais", ou valores altos sem "u" (ex: 400, 1000, 250).
+     Exemplos: "400,00 total" → stake_reais: 400 / "apostei R$ 250" → stake_reais: 250 / "1000 em reais" → stake_reais: 1000
+   - Preencha APENAS UM dos dois campos (stake_unidades OU stake_reais), nunca os dois ao mesmo tempo.
+   - Em caso de ambiguidade real, prefira stake_unidades.
 
 F. BOOKIE e CONTAS: vêm da descrição do operador. Ex: "bet365 luciadritrich" → bookie: Bet365, contas: luciadritrich. Se a casa só aparece sozinha sem conta, apenas informe o bookie.
 
@@ -156,7 +171,13 @@ H. TIPO DE APOSTA:
    - "Criar Aposta": bet builder — múltiplas seleções DO MESMO JOGO combinadas pela casa, odd única (ex: jogador X faz pontos + rebotes + assistências no mesmo jogo)
    Se não der pra inferir, null.
 
-I. CONFIANÇA: se NÃO tiver certeza de algum campo, deixe NULL. É melhor null do que errado — o operador confere depois.
+I. CONFIANÇA: se NÃO tiver certeza de algum campo ESPECÍFICO, deixe esse campo como NULL. É melhor null do que errado — o operador confere depois.
+
+J. INDEPENDÊNCIA DOS CAMPOS (CRÍTICO): cada campo é extraído SEPARADAMENTE dos outros. Incerteza, impasse ou dificuldade em UM campo NUNCA deve fazer outros campos virarem null por tabela. Exemplos:
+   - Se a odd 33.48 está claramente visível, registre 33.48 — mesmo que você tenha dúvida sobre stake, mercado ou qualquer outro campo.
+   - Se o tipster está claro no cabeçalho, registre o tipster — mesmo que tenha dúvida sobre a data do evento.
+   - Se você conseguiu identificar o evento e o esporte, registre — mesmo que não tenha certeza do tipo de aposta.
+   NUNCA "desista" de um bilhete inteiro por causa de um campo duvidoso. Extraia TUDO que você consegue, e deixa null SÓ os campos em que você realmente não tem certeza.
 
 FORMATO DE RESPOSTA (JSON puro, sem markdown):
 
@@ -170,6 +191,7 @@ FORMATO DE RESPOSTA (JSON puro, sem markdown):
       "entrada": "ex: 1W -3.5 Mapa 3, Sim, Over" ou null,
       "odd": number ou null,
       "stake_unidades": number ou null,
+      "stake_reais": number ou null,
       "tipo_aposta": "Simples|Dupla|Tripla|Múltipla|Criar Aposta" ou null,
       "tipster": "nome igual ao cadastro" ou null,
       "operador": "nome igual ao cadastro" ou null,
@@ -232,12 +254,17 @@ def montar_linha(ap, cadastros):
     esporte_id  = find_id(cadastros['esportes'], ap.get('esporte'))
 
     su = ap.get('stake_unidades')
+    sr = ap.get('stake_reais')
     data_ev = ap.get('data_evento')
-    sr = None
-    if su and tipster_id and data_ev:
+
+    # Conversão bidirecional: se tem uma ponta + valor da unidade, calcula a outra
+    if tipster_id and data_ev:
         sv = get_stake_valor(tipster_id, data_ev, cadastros['stakes'])
         if sv:
-            sr = su * sv
+            if su and not sr:
+                sr = su * sv
+            elif sr and not su:
+                su = round(sr / sv, 2)
 
     linha = {
         'data_evento': data_ev,
