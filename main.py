@@ -61,7 +61,7 @@ def tg_get_file_bytes(file_id):
     return r.content if r.ok else None
 
 def tg_react(message_id, emoji):
-    """Adiciona reação à mensagem. emoji: '✅', '⚠️', '❌', '🤔'"""
+    """Adiciona reação à mensagem. emoji: '👀' processando, '🔥' sucesso, '🤨' parcial, '🤔' não entendi, '💩' erro."""
     try:
         return tg_call('setMessageReaction',
                        chat_id=CHAT_ID, message_id=message_id,
@@ -257,7 +257,7 @@ def processar_mensagem(msg, cadastros):
     try:
         img_bytes = tg_get_file_bytes(file_id)
         if not img_bytes:
-            tg_react(msg_id, '❌')
+            tg_react(msg_id, '💩')
             return
 
         data_hoje = datetime.now(BRT).strftime('%Y-%m-%d')
@@ -287,18 +287,18 @@ def processar_mensagem(msg, cadastros):
 
         if sucesso == len(apostas):
             print(f"  ✅ {sucesso} aposta(s) registrada(s)")
-            tg_react(msg_id, '✅')
+            tg_react(msg_id, '🔥')
         elif sucesso > 0:
             print(f"  ⚠️ {sucesso}/{len(apostas)} apostas registradas")
-            tg_react(msg_id, '⚠️')
+            tg_react(msg_id, '🤨')
         else:
             print(f"  ❌ Nenhuma aposta salva")
-            tg_react(msg_id, '❌')
+            tg_react(msg_id, '💩')
 
     except Exception as e:
         print(f"  ❌ Exception: {e}")
         traceback.print_exc()
-        tg_react(msg_id, '❌')
+        tg_react(msg_id, '💩')
 
 # ============================================================
 # LOOP DE POLLING
