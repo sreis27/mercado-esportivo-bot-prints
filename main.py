@@ -111,7 +111,28 @@ CADASTROS EXISTENTES — use o nome EXATAMENTE como aparece aqui:
 - Mercados: {json.dumps(mercados_lista, ensure_ascii=False)}
 - Tipos de Aposta: {json.dumps(tipos_aposta_lista, ensure_ascii=False)}
 
-REGRAS IMPORTANTES:
+═══════════════════════════════════════════════════════════════
+REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
+═══════════════════════════════════════════════════════════════
+
+[R1] DATA: só use uma data se estiver ESCRITA EXPLICITAMENTE no print ou na descrição (rótulos "Data:", "Entrada para:", "Jogo em:", ou formato inequívoco DD/MM/AAAA). NUNCA infira data a partir de nomes de grupo, canal, temporada ou temporada-ano. Formatos como "2026.03 [nome]", "T03", "Season X" são IDENTIFICADORES DE GRUPO, NÃO DATAS. Se não há data explícita, use HOJE ({data_hoje}) como fallback. Proibido inventar datas.
+
+[R2] "CRIAR APOSTA" EXPLÍCITO = 1 ITEM SÓ: se o print tem a palavra "CRIAR APOSTA", "BET BUILDER", "ACUMULADOR DO JOGO", "MEU BILHETE" ou "JOGO DO SEU JEITO" escrita explicitamente (geralmente em destaque no topo do bilhete), é UMA aposta única com tipo_aposta = "Criar Aposta". JAMAIS quebre em várias apostas. Concatene TODAS as seleções no campo entrada, separadas por vírgula. A odd é única (a única odd do bilhete).
+
+[R3] BET365 COMO BOOKIE: quando a descrição começa com "365" (ex: "365 deia", "365 will in in"), o bookie é SEMPRE Bet365. Nunca deixe bookie null nesse caso.
+
+[R4] ESPORTE DE BASQUETE (NBA): times como "POR Trail Blazers", "SA Spurs", "Portland Trail Blazers", "San Antonio Spurs", "Lakers", "Warriors", "Celtics", "Heat", "Nets", "Bulls", "Knicks", "Rockets", "Mavericks", "Suns", "Grizzlies" e qualquer outro time da NBA → esporte: Basquete. Isto é inequívoco, não deixe null.
+
+[R5] CHECKLIST FINAL ANTES DE RESPONDER: antes de emitir o JSON, verifique mentalmente:
+   - Eu vi "CRIAR APOSTA" / "BET BUILDER" no print? → Se sim, retorno 1 item só, não vários.
+   - Eu inferi uma data? → Ela vem de texto inequívoco OU é hoje ({data_hoje})?
+   - Há times conhecidos no print? → Marquei o esporte correto?
+   - A descrição começa com bookie conhecido ("365")? → Preenchi o bookie?
+   - Todos os campos que EU DEVERIA ter preenchido estão preenchidos? → Não deixei null por cautela excessiva.
+
+═══════════════════════════════════════════════════════════════
+
+REGRAS DETALHADAS:
 
 A. OPERADOR: use o nome "{operador_msg}" (quem enviou o print). Se bater com algum nome da lista de operadores, use o nome exato do cadastro. Se não bater, deixe como está.
 
@@ -369,7 +390,15 @@ FORMATO DE RESPOSTA (JSON puro, sem markdown):
   ]
 }}
 
-Responda APENAS com o JSON."""
+Responda APENAS com o JSON.
+
+ANTES DE RESPONDER, EXECUTE O CHECKLIST [R5]:
+1. O print tem "CRIAR APOSTA"/"BET BUILDER" escrito? → Se sim, 1 item só.
+2. Alguma data que coloquei veio de texto EXPLÍCITO do print/descrição? → Se não, use HOJE ({data_hoje}).
+3. Tem time conhecido (NBA, futebol brasileiro/europeu, etc)? → Esporte marcado corretamente.
+4. Descrição tem "365"? → bookie = Bet365 (não null).
+5. Campos preenchíveis que deixei null: são realmente impossíveis de inferir, ou fui cauteloso demais?
+"""
 
     img_b64 = base64.b64encode(imagem_bytes).decode('ascii')
 
