@@ -117,35 +117,74 @@ REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
 
 [R1] DATA: só use uma data se estiver ESCRITA EXPLICITAMENTE no print ou na descrição (rótulos "Data:", "Entrada para:", "Jogo em:", ou formato inequívoco DD/MM/AAAA). NUNCA infira data a partir de nomes de grupo, canal, temporada ou temporada-ano. Formatos como "2026.03 [nome]", "T03", "Season X" são IDENTIFICADORES DE GRUPO, NÃO DATAS. Se não há data explícita, use HOJE ({data_hoje}) como fallback. Proibido inventar datas.
 
-[R2] "CRIAR APOSTA" EXPLÍCITO = 1 ITEM SÓ: se o print tem a palavra "CRIAR APOSTA", "BET BUILDER", "ACUMULADOR DO JOGO", "MEU BILHETE" ou "JOGO DO SEU JEITO" escrita explicitamente (geralmente em destaque no topo do bilhete), é UMA aposta única com tipo_aposta = "Criar Aposta". JAMAIS quebre em várias apostas. Concatene TODAS as seleções no campo entrada, separadas por vírgula. A odd é única (a única odd do bilhete).
-   EXEMPLO NEGATIVO (PROIBIDO): ver print com "CRIAR APOSTA" + seleção 1 "LeBron 10+ Rebotes" + seleção 2 "LeBron 10+ Assistências" + odd 9.50 + R$ 200, e registrar apenas "LeBron 10+ Rebotes" como Simples. ERRADO. O correto é: 1 item, tipo "Criar Aposta", entrada "LeBron 10+ Rebotes, LeBron 10+ Assistências", odd 9.50.
-   INVERSO TAMBÉM PROIBIDO: quando NÃO há "CRIAR APOSTA" escrito no print, NÃO classifique como Criar Aposta só porque o texto parece complexo. Sem a palavra explícita, use Simples/Dupla/etc conforme contagem de seleções.
+[R2] CRIAR APOSTA = 1 ITEM SÓ. Detecte Criar Aposta por DUAS VIAS:
+
+   VIA A — palavra explícita: se o print tem "CRIAR APOSTA", "BET BUILDER", "ACUMULADOR DO JOGO", "MEU BILHETE" ou "JOGO DO SEU JEITO" escrita explicitamente (geralmente em destaque no topo).
+
+   VIA B — SINAIS ESTRUTURAIS (sem palavra explícita, comum no JDF-VIP e outros): o print mostra
+   - Múltiplas seleções (2+) DO MESMO JOGADOR ou DO MESMO JOGO
+   - UMA ÚNICA cotação/odd total (ex: "COTAÇÕES 30.57", "45.81")
+   - UM ÚNICO botão APOSTAR com valor (ex: "APOSTAR R$ 1", "APOSTAR R$ 0,5")
+   - UM ÚNICO valor de "Ganhos potenciais" / "Retornos potenciais"
+   - Ícones de trash (🗑️) em cada linha da seleção
+   - Sem botões/campos de aposta individuais por linha
+   - OPCIONAL: texto "N Seleções" / "N Selections" em destaque no topo (sinal definitivo)
+
+   Quando detectar por qualquer uma das vias, é UMA aposta única com tipo_aposta = "Criar Aposta". JAMAIS quebre em várias apostas. Concatene TODAS as seleções no campo entrada, separadas por vírgula. A odd é única.
+
+   EXEMPLO NEGATIVO (PROIBIDO): ver print com "3 Seleções" em destaque + Paolo Banchero 30+ pontos + Paolo Banchero 10+ rebotes + Paolo Banchero 6+ assistências + odd 45.81 + R$ 1 e registrar 3 itens como Simples. ERRADO. O correto é: 1 item, tipo "Criar Aposta", entrada "Paolo Banchero 30+ Pontos, 10+ Rebotes, 6+ Assistências", odd 45.81.
+
+   MESMO PADRÃO NO JDF-VIP: seleções do mesmo jogador empilhadas + UMA cotação + UM valor APOSTAR = Criar Aposta SEMPRE, independente de a palavra estar escrita ou não.
+
+   INVERSO TAMBÉM PROIBIDO: sem NENHUM dos sinais acima, NÃO classifique como Criar Aposta. Se há 1 seleção só, é Simples.
 
 [R3] BET365 COMO BOOKIE: quando a descrição começa com "365" (ex: "365 deia", "365 will in in"), o bookie é SEMPRE Bet365. Nunca deixe bookie null nesse caso.
 
-[R4] ESPORTE — ESPECÍFICO PREVALECE SOBRE GENÉRICO: se a lista de esportes tem "NBA" cadastrado separadamente de "Basquete", jogos da NBA (Lakers, Spurs, Trail Blazers, Warriors, Celtics, Heat, Nets, Bulls, Knicks, Rockets, Mavericks, Suns, Grizzlies, 76ers, Kings, Clippers, Pelicans, Hawks, Raptors, Wizards, Magic, Hornets, Pacers, Pistons, Thunder, Jazz, Nuggets, Timberwolves, Bucks) → esporte: NBA. Mesma lógica vale pra outras ligas específicas cadastradas (WNBA, Euroliga, NCAA, etc.). Se só tem "Basquete" genérico, use Basquete.
+[R4] ESPORTE — ESPECÍFICO PREVALECE SOBRE GENÉRICO: se a lista de esportes tem "NBA" cadastrado separadamente de "Basquete", jogos da NBA (Lakers, Spurs, Trail Blazers, Warriors, Celtics, Heat, Nets, Bulls, Knicks, Rockets, Mavericks, Suns, Grizzlies, 76ers, Kings, Clippers, Pelicans, Hawks, Raptors, Wizards, Magic, Hornets, Pacers, Pistons, Thunder, Jazz, Nuggets, Timberwolves, Bucks) → esporte: NBA. Mesma lógica vale pra outras ligas específicas cadastradas (WNBA, Euroliga, NCAA, Futebol Feminino, etc.). Se só tem "Basquete" genérico, use Basquete.
 
 [R5] RÓTULO DA CASA PREVALECE SEMPRE: o texto que a CASA DE APOSTAS pinta explicitamente acima/ao lado da seleção no bilhete é a FONTE PRIMÁRIA do mercado. Nunca ignorar rótulos da casa como:
-   - "Total de pontos" / "Total games" / "Total de rebotes" / "Total de cartões" → mapeia pro mercado cadastrado correspondente (Pontos, Games, Rebotes, Cartões, etc.)
-   - "Handicap de Games" / "Handicap de Set" / "Handicap de Rondas" / "Handicap do Jogo" → mercado correspondente do cadastro
+   - "Total de pontos" / "Total games" / "Total de rebotes" / "Total de cartões" / "Total chutes" → mapeia pro mercado cadastrado correspondente (Pontos, Games, Rebotes, Cartões, Chutes, etc.)
+   - "Handicap de Games" / "Handicap de Set" / "Handicap de Rondas" / "Handicap do Jogo" / "Handicap de Rounds" → mercado correspondente do cadastro
+   - "Vencedor do Mapa" / "ML Mapa" / "Map Winner" → "ML Mapa" (se cadastrado, DIFERENTE de "Vencedor" / "ML" genérico)
    - "Resultado/Ambos Marcam" / "Ambos Marcam" / "Both Teams to Score" → mercado do cadastro
    - "Jogador a Marcar" / "Jogador a Dar Assistência" / "Marca Gol" → mercado do cadastro
    Fazer match semântico com a lista de Mercados cadastrada (incluindo traduções: "Anytime Goalscorer" ↔ "Anytimes", "Match Winner" ↔ "Resultado Final", etc). JAMAIS retornar "ML" ou null quando há rótulo explícito da casa no print.
 
+   ESPECIFICIDADE IMPORTA: "Chutes" ≠ "Chutes no gol" ≠ "Chutes a gol". Cada um é um mercado distinto. Nunca generalizar ou especificar além do que o rótulo literal do print indica. "Total chutes" mapeia pra "Chutes" (geral). "Chutes no gol" / "Shots on target" mapeia pra "Chutes no gol" (específico).
+
 [R6] TIPO DE APOSTA — SIMPLES É O DEFAULT: se há 1 seleção = Simples. Só desvie dessa regra quando houver SINAL INEQUÍVOCO:
-   - Palavra "CRIAR APOSTA"/"BET BUILDER" escrita → Criar Aposta
-   - Palavra "DUPLA"/"TRIPLA"/"MÚLTIPLA" escrita + múltiplas seleções + uma odd total → tipo correspondente
+   - Palavra "CRIAR APOSTA"/"BET BUILDER" escrita OU sinais estruturais de bet builder (ver R2) → Criar Aposta
+   - Palavra "DUPLA"/"TRIPLA"/"MÚLTIPLA"/"Múltipla" escrita + múltiplas seleções + uma odd total → tipo correspondente
    - Marcador de bônus ("SUPER AUMENTADA", "APOSTA AUMENTADA") → Super Aumentada (se cadastrado)
    Sem esses sinais, mesmo com layouts complexos ou múltiplas linhas visuais, é Simples.
 
+[R8] ODD DA DESCRIÇÃO PREVALECE SEMPRE SOBRE ODD DO PRINT. Quando a descrição do operador contém "odd X.XX" ou "odd X,XX" (palavra "odd" literal seguida de valor, incluindo typos "od", "ood", "odds"), esse valor SUBSTITUI a odd do print. Sem exceção. Motivos comuns: drops ao vivo, bônus aplicado no print, odd real pega divergindo do sugerido.
+   Exemplo: print mostra "Odds: 2.50" e descrição diz "365 deia odd 2,37" → odd: 2.37 (NÃO 2.50).
+   Exemplo: print mostra "1.79x" e descrição diz "pinnacle odd 1.746" → odd: 1.746.
+
+[R9] "BH" NO CABEÇALHO = "BH CS" + COUNTER-STRIKE. Quando o cabeçalho do print contém "BH" (tipicamente "BH Tipster"), o tipster é SEMPRE "BH CS" e o esporte é SEMPRE Counter-Strike. Essa regra tem prioridade absoluta sobre outros identificadores no mesmo cabeçalho (ex: "@GuiaDasApostas" no final não muda o tipster pra GDA quando há "BH" no início).
+
+[R10] STAKE É DADO CRÍTICO — SEMPRE PROCURAR. Extração de stake deve acontecer SEMPRE. Procure em TODA a imagem (bilhete + legenda do tipster + anotações) E na descrição do operador. Padrões comuns que DEVEM ser extraídos:
+   - "Xu", "X.Yu" (ex: "1u", "0.5u", "1.25u", "0.75u")
+   - "X%" (ex: "0.75%", "1%", "2%") — equivalente a unidades
+   - "@odd / Xu" (ex: "@5.50 / 0.75u", "@1.75 / 1u")
+   - "Stake: Xu", "Stake X"
+   - "Xu - Min XXX", "Xu // Min XXX"
+   - "X unid", "X unidade"
+   - "[entrada] - Xu" (ex: "Buse -4.5 - 1u")
+   - Número sozinho em linha (ex: "846" → stake_reais 846)
+   stake_unidades null só é aceitável quando NÃO há absolutamente nenhum número associado a "u", "%" ou "stake" em lugar nenhum.
+
 [R7] CHECKLIST FINAL ANTES DE RESPONDER: antes de emitir o JSON, verifique mentalmente:
-   - O print tem "CRIAR APOSTA" / "BET BUILDER" escrito? → Se sim, 1 item só. Se NÃO, não invente Criar Aposta.
-   - Eu inferi uma data? → Ela vem de texto inequívoco OU é hoje ({data_hoje})?
-   - Há times conhecidos no print? → Marquei o esporte correto (específico se existir, senão genérico)?
-   - A descrição começa com bookie conhecido ("365", "betano", "AG", "vbet", "pinnacle", "cassino", etc.)? → Preenchi o bookie?
-   - Há palavra após o bookie (ex: "marta", "deia", "will", "ellian")? → Preenchi a conta? (conta é CRÍTICO, não pode ficar null quando há palavra candidata)
-   - Há rótulo da casa visível no bilhete ("Total de pontos", "Handicap", etc.)? → Preenchi o mercado via match semântico?
-   - Há "Xu" ou "X%" na legenda do tipster? → Preenchi stake_unidades?
+   - O print tem "CRIAR APOSTA"/"BET BUILDER" escrito OU sinais estruturais de bet builder? → 1 item só. Se NÃO, não invente.
+   - Data que coloquei veio de texto EXPLÍCITO do print/descrição? → Se não, use HOJE ({data_hoje}).
+   - Times conhecidos? → Esporte marcado (específico se existir, NBA/WNBA/Futebol Feminino/etc).
+   - Descrição começa com bookie? → Preenchi o bookie.
+   - Palavra após bookie? → Preenchi a conta (CRÍTICO).
+   - Rótulo da casa no bilhete? → Preenchi o mercado via match semântico.
+   - "Xu" ou "X%" em QUALQUER parte do texto? → Preenchi stake_unidades.
+   - Descrição tem "odd X.XX"? → USEI esse valor, não o do print.
+   - Tipo_aposta: 1 seleção sem marcador = Simples. Não inventar Criar Aposta.
 
 ═══════════════════════════════════════════════════════════════
 
@@ -256,7 +295,9 @@ E. STAKE (prioridade absoluta: DESCRIÇÃO DO OPERADOR > PRINT):
 
 F. BOOKIE e CONTAS: vêm da descrição do operador, podem aparecer em qualquer ordem.
    - CONTA É DADO CRÍTICO: sempre tente extrair. Qualquer palavra não-reservada próxima ao bookie é conta. Palavras reservadas: "in", "out", "odd", "ood", "od", "odds", e números. Tudo o mais é candidato a conta.
-   - NOMES COMUNS DE CONTA (extrair SEMPRE que aparecerem na descrição): marta, will, deia, dany, ellian, nicolas, greice, leite, danyel, sorgetz, reis, kapola, vini, roger, gabi, fejao, gabriel, edson, william, chay, luciadritrich, deiav, cromo, dudu, phgpedrinho, dudulemos, geospich, pedrinho. Essa lista NÃO é exaustiva — qualquer nome próprio ou apelido curto após bookie deve ser tratado como conta.
+   - NOMES COMUNS DE CONTA (extrair SEMPRE que aparecerem na descrição): marta, will, deia, dany, ellian, nicolas, greice, leite, danyel, sorgetz, reis, kapola, vini, roger, gabi, fejao, gabriel, edson, william, chay, luciadritrich, deiav, cromo, dudu, phgpedrinho, dudulemos, geospich, pedrinho, maiato, cassiel, lucia. Essa lista NÃO é exaustiva — qualquer nome próprio ou apelido curto após bookie deve ser tratado como conta.
+   - PALAVRAS QUALITATIVAS (não são contas específicas): quando a descrição tem "Todas", "Várias", "All", "Geral" antes ou depois do bookie (ex: "Todas AG - 846 odd 1,89"), isso indica uso genérico de várias contas SEM especificar quais. Deixe contas_utilizadas null E CONTINUE extraindo normalmente os outros campos (bookie, stake, odd). NÃO deixe essa palavra bloquear a extração dos tokens seguintes.
+     Exemplo: "Todas AG - 846 odd 1,89" → bookie: Aposta Ganha, contas: null, stake_reais: 846, odd: 1.89.
    - ATENÇÃO — BOOKIE DO PRINT ≠ BOOKIE DA APOSTA: quando o print do TIPSTER mostra "LINK:", "Casa:", "Disponível em:", "Código:", ou um link de uma casa (ex: "https://www.bet365.com/..."), isso indica apenas ONDE O TIPSTER ACHOU A ODD, NÃO onde o operador efetivamente apostou. O bookie REAL da aposta SEMPRE vem da descrição do operador. Se a descrição menciona uma casa diferente da do print, a descrição PREVALECE sem exceção.
      Ex: print do PROPHET mostra "LINK: Superbet" e descrição do operador diz "betfair dany 2.20" → bookie: Betfair, conta: dany. NÃO Superbet.
    - PADRÕES COMUNS: "[bookie] [conta]" (ex: "bet365 luciadritrich", "365 deia", "365 marta", "cassino greice") OU "[conta] [bookie]" (ex: "ellian betano", "dany betfair"). Interprete flexível.
@@ -326,27 +367,37 @@ G. QUANTAS APOSTAS RETORNAR — QUATRO CENÁRIOS (CRÍTICO, fonte comum de erro)
 
    CENÁRIO 4 — Combinada explícita da casa (1 aposta única):
    O print mostra MÚLTIPLAS seleções com odds individuais visíveis, MAS há sinais claros de que é UMA única aposta combinada:
-   - Palavra explícita "TRIPLA", "DUPLA", "MÚLTIPLA", "COMBO", "ACUMULADA" no print
+   - Palavra explícita "TRIPLA", "DUPLA", "MÚLTIPLA", "Múltipla de N seleções", "COMBO", "ACUMULADA" no print
    - OU marcadores de oferta especial: "APOSTA AUMENTADA", "SUPER AUMENTADA", "GANHOS AUMENTADOS", "ODD BOOSTED", "APOSTA TURBINADA"
    - Uma ODD TOTAL/COMBINADA calculada (ex: "Odd total 15.10" ou odd única em destaque)
-   - UM ÚNICO valor apostado (ex: "Valor apostado 0.50" ou "R$50 retorna R$X")
-   - UM ÚNICO possível ganho/retorno
-   Nesse caso as odds individuais são só INFORMATIVAS (mostrando como a combinada foi calculada) — NÃO representam apostas separadas. Retorne 1 item único:
+   - UM ÚNICO valor apostado (ex: "R$ 0.25", "APOSTE JÁ R$0,25")
+   - UM ÚNICO possível ganho/retorno (ex: "Ganhos Potenciais R$ X")
+   - NENHUM campo de stake ou botão "Apostar" individual por seleção (as seleções aparecem apenas como lista informativa)
+
+   CRITÉRIO DECISIVO CENÁRIO 2 vs CENÁRIO 4 (CRÍTICO):
+   - Cenário 2 (N+1 apostas): cada seleção tem seu PRÓPRIO campo de stake, botão de apostar, valor individualizado. O print permite apostar em cada uma separadamente.
+   - Cenário 4 (1 aposta só): apenas a combinada tem stake/valor. Seleções individuais são lista informativa, sem campo próprio de aposta.
+   Se a descrição do operador só menciona UMA casa/conta (ex: "betano ellian") e o print mostra marcador de combinada + stake única, é SEMPRE Cenário 4.
+
+   No Cenário 4, retorne 1 item único:
    - tipo_aposta: ver regra I (marcador de bônus tem precedência sobre contagem de seleções)
-   - evento: FORMATO "Time A x Time B / Time C x Time D" (separar jogos com " / ", separar times dentro de cada jogo com " x "). Ex: "Corinthians x Barra SC / Vasco da Gama x Paysandu"
-   - entrada: concatenar as seleções separadas por " + " (ex: "Corinthians e Sim (Resultado/Ambos Marcam) + Vasco da Gama e Sim (Resultado/Ambos Marcam)")
-   - mercado: se os mercados forem iguais em todos os jogos, preencher (match semântico com a lista); se mistos, null
-   - esporte: se todos os jogos são do mesmo esporte, preencher; se mistos, null
+   - evento: apenas "Dupla" / "Tripla" / "Múltipla" (conforme o tipo). NÃO concatenar nomes de jogos.
+   - entrada: concatenar as seleções separadas por " + " (ex: "Corinthians e Sim + Vasco da Gama e Sim" ou "Mais de 9.5 Chutes + Menos de 33.5 Total de gols + CS Minaur +1.5 Handicap")
+   - mercado: se os mercados forem iguais em todos os jogos, preencher (match semântico); se mistos, usar "Múltiplos"
+   - esporte: se todos os jogos são do mesmo esporte, preencher. Se mistos (ex: Futebol + Futebol Feminino, NBA + WNBA, CS + LOL), null.
    - odd: a odd total/final (ex: 27.50)
    - stake: o único valor do bilhete
 
    Ex 1: Print com 3 seleções de futebol, odd total 15.10, 0.50u apostado → 1 item:
-   {{"tipo_aposta": "Tripla", "evento": "RC Lens x Toulouse / Girona x Betis / Brighton x Chelsea", "entrada": "RC Lens - Toulouse Menos de 1.5 + Girona - Betis Mais de 0.5 + Brighton - Chelsea Mais de 2.5", "odd": 15.10, "stake_unidades": 0.5, "esporte": "Futebol", "mercado": null}}
+   {{"tipo_aposta": "Tripla", "evento": "Tripla", "entrada": "RC Lens Menos de 1.5 + Girona Mais de 0.5 + Brighton Mais de 2.5", "odd": 15.10, "stake_unidades": 0.5, "esporte": "Futebol", "mercado": null}}
 
-   Ex 2: Print com "APOSTA AUMENTADA" + 2 seleções de futebol (Corinthians e Sim / Vasco e Sim), odd 27.50, R$50 apostado → 1 item:
-   {{"tipo_aposta": "Super Aumentada", "evento": "Corinthians x Barra SC / Vasco da Gama x Paysandu", "entrada": "Corinthians e Sim + Vasco da Gama e Sim", "odd": 27.50, "stake_reais": 50, "esporte": "Futebol", "mercado": "Ambos Marcam"}}
+   Ex 2: Print com "APOSTA AUMENTADA" + 2 seleções de futebol, odd 27.50, R$50 apostado → 1 item:
+   {{"tipo_aposta": "Super Aumentada", "evento": "Dupla", "entrada": "Corinthians e Sim + Vasco da Gama e Sim", "odd": 27.50, "stake_reais": 50, "esporte": "Futebol", "mercado": "Ambos Marcam"}}
 
-   REGRA-CHAVE: marcador explícito de combinada OU de bônus + odd total + valor único = Cenário 4 (1 item). Múltiplas odds sem marcador de combinada = Cenário 2 (N itens mapeados pela descrição). Bet builder do mesmo jogo = Cenário 1.
+   Ex 3: Print com "TRIPLA (B x M / B x H x S)" + 3 seleções mistas + odd 8.83 + R$ 0.25 → 1 item:
+   {{"tipo_aposta": "Tripla", "evento": "Tripla", "entrada": "Mais de 9.5 Chutes + Menos de 33.5 Total de gols + CS Minaur +1.5 Handicap", "odd": 8.83, "stake_unidades": 0.25, "esporte": null, "mercado": "Múltiplos"}}
+
+   REGRA-CHAVE: marcador explícito de combinada OU de bônus + odd total + valor único + ausência de stakes individuais por seleção = Cenário 4 (1 item). Múltiplas odds COM stakes individuais por seleção = Cenário 2 (N itens mapeados pela descrição). Bet builder do mesmo jogo/jogador = Cenário 1.
 
 H. DESCRIÇÃO = N APOSTAS AUTOSSUFICIENTES (importante complemento ao Cenário 2):
    Quando a descrição contém várias linhas, cada linha representa UMA aposta que se diferencia do bilhete visual em algum aspecto (casa diferente, stake diferente, odd real pega, conta diferente). O número de apostas registradas deve bater com o número de LINHAS ÚTEIS da descrição, não com o número de odds do print.
@@ -436,7 +487,12 @@ K. INDEPENDÊNCIA DOS CAMPOS (CRÍTICO): cada campo é extraído SEPARADAMENTE d
    NUNCA "desista" de um bilhete inteiro por causa de um campo duvidoso. Extraia TUDO que você consegue, e deixa null SÓ os campos em que você realmente não tem certeza.
 
 L. EXTRAÇÃO DE EVENTO E MERCADO DIRETO DO PRINT: quando o print mostra claramente os times e o mercado, EXTRAIA. Não deixe null por excesso de cautela.
-   - EVENTO: o print sempre mostra os times/participantes. Aceite qualquer separador: "Time A x Time B", "Time A - Time B", "Time A vs Time B", "Time A @ Time B". Todos viram o campo evento. Ex do print "Operário-PR - Fluminense" → evento: "Operário-PR x Fluminense".
+   - EVENTO: o print sempre mostra os times/participantes. Aceite qualquer separador: "Time A x Time B", "Time A - Time B", "Time A vs Time B", "Time A @ Time B", "Time A v Time B". Todos viram o campo evento no formato "Time A x Time B". Ex do print "Operário-PR - Fluminense" → evento: "Operário-PR x Fluminense".
+   - EVENTO EM MERCADOS DE JOGADOR (CRÍTICO): em mercados tipo "Jogador a Marcar", "Jogador a Dar Assistência", "Pontos/Rebotes/Assistências do Jogador", "Cartão do Jogador", a estrutura do print tem:
+     (i) NOME DO JOGADOR (quem) → vai pra `entrada` (ex: "Davide Zappacosta", "LeBron James 10+ Pontos")
+     (ii) MERCADO → vai pra `mercado` (ex: "Assistências", "Anytimes", "Pontos")
+     (iii) PARTIDA "Time A v Time B" → vai pra `evento` (ex: "Atalanta x Lazio", "Bayer Leverkusen x Bayern de Munique")
+     NUNCA coloque o nome do jogador no campo evento. O evento é SEMPRE os times da partida, geralmente aparecem logo abaixo do nome do jogador em fonte menor/mais sutil.
    - EVENTO INFERÍVEL DE TABELA DE OPÇÕES: quando o print não mostra "Time A x Time B" explícito mas lista os dois times como opções de resultado (ex: tabela com colunas/linhas "Flamengo / Vitória / Empate"), extraia os dois times como evento ("Flamengo x Vitória"). A palavra "Empate" nunca é time.
    - EVENTO TRUNCADO: quando o print mostra o nome dos times cortado ("Houston Rock...", "San Antonio Spu..."), NÃO completar por inferência. Use o texto parcial como aparece ou deixe null.
    - ENTRADA EM TABELA CRUZADA: quando o print mostra uma matriz tipo "Sim/Não × Resultados" (ex: colunas Sim/Não e linhas Flamengo/Vitória/Empate), a entrada é LINHA + COLUNA selecionada conforme descrição do operador. Ex: "Flamengo e Não @1.90" → entrada: "Flamengo e Não".
@@ -483,14 +539,16 @@ FORMATO DE RESPOSTA (JSON puro, sem markdown):
 Responda APENAS com o JSON.
 
 ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
-1. O print tem "CRIAR APOSTA"/"BET BUILDER" escrito LITERALMENTE? → Se sim, 1 item só. Se NÃO, não invente.
-2. Alguma data que coloquei veio de texto EXPLÍCITO do print/descrição? → Se não, use HOJE ({data_hoje}).
-3. Tem time conhecido? → Esporte marcado (específico se existir, NBA/WNBA/etc; senão, genérico).
-4. Descrição começa com bookie? → Preenchi o bookie.
-5. Há palavra após bookie? → Preenchi a conta (CRÍTICO — não deixar null quando há palavra candidata).
-6. Há rótulo da casa no bilhete (Total de pontos, Handicap de X, etc)? → Preenchi o mercado via match semântico.
-7. Há "Xu" ou "X%" na legenda do tipster (em qualquer posição, com qualquer separador)? → Preenchi stake_unidades.
-8. Tipo_aposta: se há 1 seleção só e nenhum marcador especial, é Simples — NÃO inventar "Criar Aposta".
+1. Bet builder? → Print tem "CRIAR APOSTA"/"BET BUILDER" OU sinais estruturais (múltiplas seleções do mesmo jogador/jogo + 1 odd + 1 valor APOSTAR + sem botões individuais + opcionalmente "N Seleções" em destaque)? → 1 item só, tipo "Criar Aposta", entrada concatenada. Se NÃO, não invente.
+2. Data veio de texto EXPLÍCITO do print/descrição? → Se não, use HOJE ({data_hoje}).
+3. Times conhecidos? → Esporte marcado (específico: NBA/WNBA/Futebol Feminino se existir).
+4. Descrição começa com bookie? → Preenchi o bookie (incluindo "365"→Bet365, "AG"→Aposta Ganha).
+5. Palavra após bookie? → Preenchi a conta. Exceto se for palavra qualitativa ("Todas", "Várias") = null mas continua extração.
+6. Rótulo da casa no bilhete? → Preenchi o mercado via match semântico respeitando especificidade exata ("Chutes" ≠ "Chutes no gol"; "Vencedor" ≠ "Vencedor do Mapa").
+7. STAKE: há "Xu", "X%", "@odd / Xu", "Stake: X" em QUALQUER parte do texto (imagem + descrição)? → Preenchi stake_unidades. Nunca null se há sinal.
+8. ODD: descrição tem "odd X.XX" (ou typos "od"/"ood")? → USEI esse valor, NÃO o do print.
+9. "BH" no cabeçalho? → tipster "BH CS" + esporte "Counter-Strike".
+10. Tipo_aposta: 1 seleção sem marcador especial = Simples. Não inventar Criar Aposta.
 """
 
     img_b64 = base64.b64encode(imagem_bytes).decode('ascii')
