@@ -286,22 +286,26 @@ G. QUANTAS APOSTAS RETORNAR — QUATRO CENÁRIOS (CRÍTICO, fonte comum de erro)
    CENÁRIO 4 — Combinada explícita da casa (1 aposta única):
    O print mostra MÚLTIPLAS seleções com odds individuais visíveis, MAS há sinais claros de que é UMA única aposta combinada:
    - Palavra explícita "TRIPLA", "DUPLA", "MÚLTIPLA", "COMBO", "ACUMULADA" no print
-   - Uma ODD TOTAL/COMBINADA calculada (ex: "Odd total 15.10")
-   - UM ÚNICO valor apostado (ex: "Valor apostado 0.50")
+   - OU marcadores de oferta especial: "APOSTA AUMENTADA", "SUPER AUMENTADA", "GANHOS AUMENTADOS", "ODD BOOSTED", "APOSTA TURBINADA"
+   - Uma ODD TOTAL/COMBINADA calculada (ex: "Odd total 15.10" ou odd única em destaque)
+   - UM ÚNICO valor apostado (ex: "Valor apostado 0.50" ou "R$50 retorna R$X")
    - UM ÚNICO possível ganho/retorno
    Nesse caso as odds individuais são só INFORMATIVAS (mostrando como a combinada foi calculada) — NÃO representam apostas separadas. Retorne 1 item único:
-   - tipo_aposta: "Tripla" (ou Dupla/Múltipla conforme número de seleções)
-   - evento: apenas "Tripla" (ou "Dupla"/"Múltipla") — NÃO concatenar os eventos dos jogos
-   - entrada: concatenar as seleções separadas por " + " (ex: "RC Lens - Toulouse Menos de 1.5 + Girona - Betis Mais de 0.5 + Brighton - Chelsea Mais de 2.5")
-   - mercado: null (mercados diferentes)
+   - tipo_aposta: ver regra I (marcador de bônus tem precedência sobre contagem de seleções)
+   - evento: FORMATO "Time A x Time B / Time C x Time D" (separar jogos com " / ", separar times dentro de cada jogo com " x "). Ex: "Corinthians x Barra SC / Vasco da Gama x Paysandu"
+   - entrada: concatenar as seleções separadas por " + " (ex: "Corinthians e Sim (Resultado/Ambos Marcam) + Vasco da Gama e Sim (Resultado/Ambos Marcam)")
+   - mercado: se os mercados forem iguais em todos os jogos, preencher (match semântico com a lista); se mistos, null
    - esporte: se todos os jogos são do mesmo esporte, preencher; se mistos, null
-   - odd: a odd total (15.10)
+   - odd: a odd total/final (ex: 27.50)
    - stake: o único valor do bilhete
 
-   Ex: Print com 3 seleções de futebol, odd total 15.10, 0.50u apostado → 1 item:
-   {{"tipo_aposta": "Tripla", "evento": "Tripla", "entrada": "RC Lens - Toulouse Menos de 1.5 + Girona - Betis Mais de 0.5 + Brighton - Chelsea Mais de 2.5", "odd": 15.10, "stake_unidades": 0.5, "esporte": "Futebol", "mercado": null}}
+   Ex 1: Print com 3 seleções de futebol, odd total 15.10, 0.50u apostado → 1 item:
+   {{"tipo_aposta": "Tripla", "evento": "RC Lens x Toulouse / Girona x Betis / Brighton x Chelsea", "entrada": "RC Lens - Toulouse Menos de 1.5 + Girona - Betis Mais de 0.5 + Brighton - Chelsea Mais de 2.5", "odd": 15.10, "stake_unidades": 0.5, "esporte": "Futebol", "mercado": null}}
 
-   REGRA-CHAVE: marcador explícito de combinada + odd total + valor único = Cenário 4 (1 item). Múltiplas odds sem marcador de combinada = Cenário 2 (N itens mapeados pela descrição). Bet builder do mesmo jogo = Cenário 1.
+   Ex 2: Print com "APOSTA AUMENTADA" + 2 seleções de futebol (Corinthians e Sim / Vasco e Sim), odd 27.50, R$50 apostado → 1 item:
+   {{"tipo_aposta": "Super Aumentada", "evento": "Corinthians x Barra SC / Vasco da Gama x Paysandu", "entrada": "Corinthians e Sim + Vasco da Gama e Sim", "odd": 27.50, "stake_reais": 50, "esporte": "Futebol", "mercado": "Ambos Marcam"}}
+
+   REGRA-CHAVE: marcador explícito de combinada OU de bônus + odd total + valor único = Cenário 4 (1 item). Múltiplas odds sem marcador de combinada = Cenário 2 (N itens mapeados pela descrição). Bet builder do mesmo jogo = Cenário 1.
 
 H. DESCRIÇÃO = N APOSTAS AUTOSSUFICIENTES (importante complemento ao Cenário 2):
    Quando a descrição contém várias linhas, cada linha representa UMA aposta que se diferencia do bilhete visual em algum aspecto (casa diferente, stake diferente, odd real pega, conta diferente). O número de apostas registradas deve bater com o número de LINHAS ÚTEIS da descrição, não com o número de odds do print.
@@ -334,13 +338,22 @@ M. GRAMÁTICA DE ESTADOS POSICIONAIS NA DESCRIÇÃO (padrão crescente de uso):
 
    Quando a descrição segue essa gramática, ela é a fonte DEFINITIVA de quais apostas foram feitas. Não invente apostas a mais nem a menos.
 
-I. TIPO DE APOSTA — use MATCH SEMÂNTICO com a lista de Tipos de Aposta cadastrados (acima). Use o nome EXATO do cadastro quando reconhecer a intenção. Tipos padrão:
-   - "Simples": 1 única seleção
-   - "Dupla": 2 seleções combinadas de JOGOS/MERCADOS DIFERENTES, odd única
-   - "Tripla": 3 seleções combinadas de jogos/mercados diferentes, odd única
-   - "Múltipla": 4+ seleções combinadas de jogos/mercados diferentes, odd única
-   - "Criar Aposta": bet builder — múltiplas seleções DO MESMO JOGO combinadas pela casa, odd única (ex: jogador X faz pontos + rebotes + assistências no mesmo jogo)
-   Podem existir outros tipos cadastrados (ex: "Super Aumentada", "Aposta Turbinada"). Quando o print mostrar marcador EXPLÍCITO de uma dessas modalidades especiais (ex: faixa "SUPER AUMENTADA", "GANHOS AUMENTADOS", "ODD BOOSTED"), use o tipo correspondente do cadastro se existir. Se o marcador existe mas não há tipo correspondente na lista, use "Criar Aposta" como fallback.
+I. TIPO DE APOSTA — use MATCH SEMÂNTICO com a lista de Tipos de Aposta cadastrados (acima). Use o nome EXATO do cadastro quando reconhecer a intenção.
+
+   HIERARQUIA DE DECISÃO (topo tem precedência):
+   1) MARCADOR EXPLÍCITO DE OFERTA ESPECIAL NO PRINT → use o tipo correspondente do cadastro, IGNORANDO a contagem de seleções. Marcadores que disparam essa regra:
+      - "SUPER AUMENTADA", "APOSTA AUMENTADA", "GANHOS AUMENTADOS" → "Super Aumentada" (se cadastrado)
+      - "APOSTA TURBINADA", "ODD BOOSTED", "SUPER ODDS", "BOOST +X%" → tipo correspondente do cadastro
+      - Transição visual de odd (ex: "21.37 >> 27.50") indicando aumento → idem
+      - "CRIAR APOSTA", "BET BUILDER", "ACUMULADOR DO JOGO", "MEU BILHETE", "JOGO DO SEU JEITO" → "Criar Aposta"
+      Importante: uma Dupla com marcador "APOSTA AUMENTADA" é "Super Aumentada", NÃO "Dupla". O marcador prevalece.
+   2) CONTAGEM DE SELEÇÕES (quando não há marcador de oferta especial):
+      - "Simples": 1 única seleção
+      - "Dupla": 2 seleções combinadas de JOGOS/MERCADOS DIFERENTES, odd única
+      - "Tripla": 3 seleções combinadas de jogos/mercados diferentes, odd única
+      - "Múltipla": 4+ seleções combinadas de jogos/mercados diferentes, odd única
+
+   Se houver marcador especial mas NENHUM tipo correspondente na lista cadastrada, use "Criar Aposta" como fallback.
    Se não der pra inferir de forma alguma, null.
 
 J. CONFIANÇA: se NÃO tiver certeza de algum campo ESPECÍFICO, deixe esse campo como NULL. É melhor null do que errado — o operador confere depois.
