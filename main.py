@@ -140,7 +140,8 @@ B. TIPSTER: deduza pelo cabeçalho/título do print. O nome que aparece no cabe�
    (i) o nome do GRUPO diretamente (ex: "BH Tipster" → "BH CS")
    (ii) um USUÁRIO/APELIDO que assina o print em nome do grupo (ex: "Italo Cards" aparece no print mas o grupo está cadastrado como "Italo Cartões")
    (iii) o nome ESTILIZADO com separadores decorativos — pontos, traços, espaços entre letras (ex: "P.R.O.P.H.E.T" → "PROPHET", "J D F - V I P" → "JDF-VIP", "S.E.T.T.A" → "SETTA"). NORMALIZE removendo pontos, hífens e espaços extras antes de comparar com a lista.
-   Quando houver similaridade temática entre o nome no print e um item da lista (cards ↔ cartões, traduções, abreviações, variações), PRIORIZE o match do cadastro em vez de usar o texto literal do print. Use o nome EXATAMENTE como está na lista de tipsters.
+   (iv) MÚLTIPLOS NOMES unidos por "&", "|", "/", "+", "e" (ex: "Syro & GuiaDasApostas", "NBA 25/26 | Live | Syro & GuiaDasApostas"). Nesse caso, tente casar CADA palavra/nome individualmente com a lista — o cadastro pode usar só parte do nome, abreviações ou reordenação (ex: "Syro & GuiaDasApostas" pode estar cadastrado como "GDA Syro", "Syro GDA", "Syro", etc). Se alguma palavra casa, use o nome exato do cadastro.
+   Quando houver similaridade temática entre o nome no print e um item da lista (cards ↔ cartões, traduções, abreviações, variações, siglas como "GDA" ↔ "GuiaDasApostas"), PRIORIZE o match do cadastro em vez de usar o texto literal do print. Use o nome EXATAMENTE como está na lista de tipsters.
    Se aparecer "GOA", pode ser "GOA TOM", "GOA Fut Fem", "GOA Tradicional" — use o contexto da aposta (esporte, tipo de mercado) pra decidir qual.
 
 C. ESPORTE: INFIRA por COMBINAÇÃO DE SINAIS (nome de time + mercado + torneio + contexto). NUNCA decida esporte baseado apenas em um nome de time, porque nomes são ambíguos:
@@ -462,9 +463,21 @@ def find_id(arr, nome):
     for x in arr:
         if x['nome'].lower() == nome_l:
             return x['id']
-    # Partial
+    # Substring bidirecional (preserva comportamento anterior)
     for x in arr:
         if nome_l in x['nome'].lower() or x['nome'].lower() in nome_l:
+            return x['id']
+    # Match por tokens: quebra em palavras e checa interseção significativa
+    # Útil pra nomes compostos tipo "Syro & GuiaDasApostas" vs cadastro "GDA Syro"
+    STOP = {'&', 'e', '+', '-', '|', '/', 'de', 'da', 'do', 'das', 'dos', ''}
+    tokens_in = {t.strip('.,;:()[]') for t in re.split(r'[\s&|/+]+', nome_l) if t}
+    tokens_in = {t for t in tokens_in if t and t not in STOP and len(t) >= 3}
+    if not tokens_in:
+        return None
+    for x in arr:
+        tokens_x = {t.strip('.,;:()[]') for t in re.split(r'[\s&|/+]+', x['nome'].lower()) if t}
+        tokens_x = {t for t in tokens_x if t and t not in STOP and len(t) >= 3}
+        if tokens_in & tokens_x:
             return x['id']
     return None
 
