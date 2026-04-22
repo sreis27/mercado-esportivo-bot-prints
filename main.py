@@ -427,10 +427,30 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R5]:
         }]
     )
 
-    text = resp.content[0].text.strip()
+    text_raw = resp.content[0].text
+    text = text_raw.strip()
     text = re.sub(r'^```(?:json)?\s*', '', text)
     text = re.sub(r'\s*```$', '', text)
-    return json.loads(text)
+
+    # Proteção contra resposta vazia/não-JSON (modelo pode retornar texto explicativo)
+    if not text or not text.startswith('{'):
+        print(f"  ⚠️ Resposta do modelo não é JSON válido:")
+        print(f"     Raw: {text_raw[:500]}")
+        # Tenta extrair JSON no meio do texto (modelo pode ter prefixado com explicação)
+        match = re.search(r'\{.*"apostas".*\}', text_raw, re.DOTALL)
+        if match:
+            text = match.group(0)
+            print(f"  ✅ JSON extraído do meio da resposta")
+        else:
+            # Sem JSON → retorna estrutura vazia pra tratar como "não entendi"
+            return {'apostas': []}
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        print(f"  ⚠️ JSONDecodeError: {e}")
+        print(f"     Texto: {text[:500]}")
+        return {'apostas': []}
 
 # ============================================================
 # CONVERTE DADOS EXTRAÍDOS → LINHA DO SUPABASE
