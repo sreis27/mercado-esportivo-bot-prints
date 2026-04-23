@@ -166,6 +166,12 @@ REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
 
 [R9] "BH" NO CABEÇALHO = "BH CS" + COUNTER-STRIKE. Quando o cabeçalho do print contém "BH" (tipicamente "BH Tipster"), o tipster é SEMPRE "BH CS" e o esporte é SEMPRE Counter-Strike. Essa regra tem prioridade absoluta sobre outros identificadores no mesmo cabeçalho (ex: "@GuiaDasApostas" no final não muda o tipster pra GDA quando há "BH" no início).
 
+[R9.5] LEGENDA DO TIPSTER É FONTE PRIMÁRIA DE SELEÇÃO. Quando o bilhete mostra múltiplas opções (ex: Resultado Final 1x2 com Bahia 1.80 / Empate 3.60 / Santos 4.50, Over/Under, handicaps) SEM destaque visual de qual foi escolhida, a LEGENDA DO TIPSTER (texto abaixo ou próximo do bilhete) é a ÚNICA fonte confiável da seleção real. Padrão comum: "[seleção] @[odd] / [stake]" ou "[seleção] @[odd]" ou apenas uma linha narrativa tipo "[seleção] vence".
+   - Exemplo: bilhete mostra Bahia 1.80 / Empate 3.60 / Santos 4.50 e legenda diz "Bahia vence @1.80 / 1,25u" → entrada: "Bahia", odd: 1.80, stake_unidades: 1.25, mercado: ML (resultado final).
+   - Exemplo: bilhete Over/Under 2.5 com ambas odds visíveis e legenda "Under 2.5 @1.95 / 0.5u" → entrada: "Under 2.5", odd: 1.95, stake_unidades: 0.5.
+   - Exemplo: bilhete 1x2 sem destaque e legenda "Empate @3.20" → entrada: "Empate", odd: 3.20.
+   NUNCA pegue a primeira odd visível ou a odd maior por default. Se a legenda existe, ELA RESOLVE tudo — entrada, odd e stake saem da linha `@odd / Xu`.
+
 [R10] STAKE É DADO CRÍTICO — SEMPRE PROCURAR. Extração de stake deve acontecer SEMPRE. Procure em TODA a imagem (bilhete + legenda do tipster + anotações) E na descrição do operador. Padrões comuns que DEVEM ser extraídos:
    - "Xu", "X.Yu" (ex: "1u", "0.5u", "1.25u", "0.75u")
    - "X%" (ex: "0.75%", "1%", "2%") — equivalente a unidades
@@ -188,6 +194,7 @@ REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
    - Descrição começa com bookie? → Preenchi o bookie.
    - Palavra após bookie? → Preenchi a conta (CRÍTICO).
    - Rótulo da casa no bilhete? → Preenchi o mercado via match semântico.
+   - Bilhete mostra múltiplas opções (1x2, Over/Under) sem destaque visual? → Usei a LEGENDA DO TIPSTER pra definir entrada/odd/stake. Não peguei odd aleatória.
    - Legenda do tipster tem "Stake: Xu" ou "Xu" sozinho em linha? → stake_unidades PREENCHIDA (NUNCA zero).
    - Legenda do tipster tem "Odds: X.XX"? → odd PREENCHIDA (NUNCA zero).
    - "Xu" ou "X%" em QUALQUER parte do texto? → Preenchi stake_unidades.
