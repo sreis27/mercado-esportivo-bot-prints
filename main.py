@@ -161,6 +161,8 @@ REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
 [R8] ODD DA DESCRIÇÃO PREVALECE SEMPRE SOBRE ODD DO PRINT. Quando a descrição do operador contém "odd X.XX" ou "odd X,XX" (palavra "odd" literal seguida de valor, incluindo typos "od", "ood", "odds"), esse valor SUBSTITUI a odd do print. Sem exceção. Motivos comuns: drops ao vivo, bônus aplicado no print, odd real pega divergindo do sugerido.
    Exemplo: print mostra "Odds: 2.50" e descrição diz "365 deia odd 2,37" → odd: 2.37 (NÃO 2.50).
    Exemplo: print mostra "1.79x" e descrição diz "pinnacle odd 1.746" → odd: 1.746.
+   
+   IMPORTANTE — ODD DA LEGENDA DO TIPSTER: quando a legenda do tipster contém "Odds: X.XX" ou "Odd: X.XX" em linha rotulada (ex: "Stake: 0.50u\nOdds: 3.40"), esse é o valor primário de odd. NUNCA deixe odd em 0 quando há "Odds: X.XX" ou "Odd: X.XX" no texto — extraia diretamente.
 
 [R9] "BH" NO CABEÇALHO = "BH CS" + COUNTER-STRIKE. Quando o cabeçalho do print contém "BH" (tipicamente "BH Tipster"), o tipster é SEMPRE "BH CS" e o esporte é SEMPRE Counter-Strike. Essa regra tem prioridade absoluta sobre outros identificadores no mesmo cabeçalho (ex: "@GuiaDasApostas" no final não muda o tipster pra GDA quando há "BH" no início).
 
@@ -168,12 +170,16 @@ REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
    - "Xu", "X.Yu" (ex: "1u", "0.5u", "1.25u", "0.75u")
    - "X%" (ex: "0.75%", "1%", "2%") — equivalente a unidades
    - "@odd / Xu" (ex: "@5.50 / 0.75u", "@1.75 / 1u")
-   - "Stake: Xu", "Stake X"
-   - "Xu - Min XXX", "Xu // Min XXX"
+   - "Stake: Xu", "Stake X", "Stake 0.50u", "Stake: 1u" (linha rotulada em legenda do tipster — SEMPRE extrair)
+   - "Xu - Min XXX", "Xu // Min XXX" (a letra "u" indica stake; "Min X.XX" ao lado é odd mínima, NUNCA interprete "Min" como stake)
+   - "Odds: X.XX" + linha separada "Stake: Yu" ou apenas "Yu" → odd vem de "Odds:" e stake vem do "Yu"
    - "X unid", "X unidade"
    - "[entrada] - Xu" (ex: "Buse -4.5 - 1u")
+   - "Xu" sozinho numa linha da legenda do tipster (ex: linhas soltas "LIVE", "1u", "Min - 1.62" — o "1u" É A STAKE, "Min - 1.62" é odd mínima)
    - Número sozinho em linha (ex: "846" → stake_reais 846)
    stake_unidades null só é aceitável quando NÃO há absolutamente nenhum número associado a "u", "%" ou "stake" em lugar nenhum.
+   
+   ATENÇÃO: legendas de tipster frequentemente vêm em formato estruturado com linhas rotuladas tipo "Stake: Xu" / "Odds: Y.YY" / "Min: Z.ZZ". Esses rótulos são FONTE PRIMÁRIA — extraia o valor diretamente da linha rotulada. NUNCA deixe stake em zero quando há "Stake: Xu" ou "Xu" sozinho em linha no texto da mensagem.
 
 [R7] CHECKLIST FINAL ANTES DE RESPONDER: antes de emitir o JSON, verifique mentalmente:
    - O print tem "CRIAR APOSTA"/"BET BUILDER" escrito OU sinais estruturais de bet builder? → 1 item só. Se NÃO, não invente.
@@ -182,6 +188,8 @@ REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
    - Descrição começa com bookie? → Preenchi o bookie.
    - Palavra após bookie? → Preenchi a conta (CRÍTICO).
    - Rótulo da casa no bilhete? → Preenchi o mercado via match semântico.
+   - Legenda do tipster tem "Stake: Xu" ou "Xu" sozinho em linha? → stake_unidades PREENCHIDA (NUNCA zero).
+   - Legenda do tipster tem "Odds: X.XX"? → odd PREENCHIDA (NUNCA zero).
    - "Xu" ou "X%" em QUALQUER parte do texto? → Preenchi stake_unidades.
    - Descrição tem "odd X.XX"? → USEI esse valor, não o do print.
    - Tipo_aposta: 1 seleção sem marcador = Simples. Não inventar Criar Aposta.
