@@ -73,12 +73,13 @@ def tg_react(message_id, emoji):
 # EXTRAÇÃO VIA CLAUDE VISION
 # ============================================================
 def carregar_cadastros():
-    """Carrega listas de cadastros do Supabase pra contextualizar o Claude."""
+    """Carrega listas de cadastros do Supabase pra contextualizar o Claude.
+    Tipsters, bookies e esportes inativos são filtrados (nao aparecem como opcoes)."""
     return {
-        'tipsters': sb_get('tipsters?select=id,nome'),
-        'bookies': sb_get('bookies?select=id,nome'),
+        'tipsters': sb_get('tipsters?select=id,nome&ativo=eq.true'),
+        'bookies': sb_get('bookies?select=id,nome&ativo=eq.true'),
         'operadores': sb_get('operadores?select=id,nome'),
-        'esportes': sb_get('esportes?select=id,nome'),
+        'esportes': sb_get('esportes?select=id,nome&ativo=eq.true'),
         'mercados': sb_get('mercados?select=id,nome'),
         'tipos_aposta': sb_get('tipos_aposta?select=id,nome'),
         'stakes': sb_get('stakes_historico?select=tipster_id,valor_reais,vigente_a_partir'),
@@ -165,6 +166,17 @@ REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
    IMPORTANTE — ODD DA LEGENDA DO TIPSTER: quando a legenda do tipster contém "Odds: X.XX" ou "Odd: X.XX" em linha rotulada (ex: "Stake: 0.50u\nOdds: 3.40"), esse é o valor primário de odd. NUNCA deixe odd em 0 quando há "Odds: X.XX" ou "Odd: X.XX" no texto — extraia diretamente.
 
 [R9] "BH" NO CABEÇALHO = "BH CS" + COUNTER-STRIKE. Quando o cabeçalho do print contém "BH" (tipicamente "BH Tipster"), o tipster é SEMPRE "BH CS" e o esporte é SEMPRE Counter-Strike. Essa regra tem prioridade absoluta sobre outros identificadores no mesmo cabeçalho (ex: "@GuiaDasApostas" no final não muda o tipster pra GDA quando há "BH" no início).
+
+[R9.1] "Projeto Fezinha" NO CABEÇALHO = SEMPRE 1 APOSTA MÚLTIPLA, NUNCA INDIVIDUAIS. Tipsters do Projeto Fezinha SÓ enviam combinadas — nunca são feitas as entradas individuais. Regra:
+   - Cabeçalho contém "Projeto Fezinha" ou "Fezinha" → gere EXATAMENTE 1 aposta no array, tipo_aposta conforme número de seleções: 2=Dupla, 3=Tripla, 4+=Multipla.
+   - NUNCA gere 1 aposta por seleção mesmo se o bilhete mostrar cada jogo listado com sua própria odd.
+   - NUNCA gere individuais + 1 múltipla (duplicação). Retorne SOMENTE a múltipla.
+   - Campo odd = "Odd total" do bilhete (SEMPRE presente, geralmente no rodapé: "Odd total 142.62", "Múltipla de 6 = 107.90", etc).
+   - Campo stake_unidades = única stake do bilhete (geralmente no rodapé: "0.15", "Valor apostado 0.15").
+   - Campo entrada = seleções concatenadas separadas por " + " (ex: "Menos de 7.5 + Mais de 29.5 + Mais de 0.5 + ..."). Mantenha curto.
+   - Campo evento = "Múltipla" (simples, sem concatenar nomes de jogos).
+   - Campo mercado = "Múltiplos" se houver mercados variados.
+   - Campo esporte = null se houver esportes mistos.
 
 [R9.5] LEGENDA DO TIPSTER É FONTE PRIMÁRIA DE SELEÇÃO. Quando o bilhete mostra múltiplas opções (ex: Resultado Final 1x2 com Bahia 1.80 / Empate 3.60 / Santos 4.50, Over/Under, handicaps) SEM destaque visual de qual foi escolhida, a LEGENDA DO TIPSTER (texto abaixo ou próximo do bilhete) é a ÚNICA fonte confiável da seleção real. Padrão comum: "[seleção] @[odd] / [stake]" ou "[seleção] @[odd]" ou apenas uma linha narrativa tipo "[seleção] vence".
    - Exemplo: bilhete mostra Bahia 1.80 / Empate 3.60 / Santos 4.50 e legenda diz "Bahia vence @1.80 / 1,25u" → entrada: "Bahia", odd: 1.80, stake_unidades: 1.25, mercado: ML (resultado final).
