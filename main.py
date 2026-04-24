@@ -123,6 +123,13 @@ REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
 
 [R1] DATA: só use uma data se estiver ESCRITA EXPLICITAMENTE no print ou na descrição (rótulos "Data:", "Entrada para:", "Jogo em:", ou formato inequívoco DD/MM/AAAA). NUNCA infira data a partir de nomes de grupo, canal, temporada ou temporada-ano. Formatos como "2026.03 [nome]", "T03", "Season X" são IDENTIFICADORES DE GRUPO, NÃO DATAS. Se não há data explícita, use a DATA DE HOJE informada no contexto como fallback. Proibido inventar datas.
 
+   ATENÇÃO ESPECIAL — CABEÇALHOS COM "AAAA.MM" ou "AAAA-MM" NO NOME DO GRUPO:
+   - Exemplo: cabeçalho "2026.03 Courtside" → "2026.03" é APENAS identificador de temporada/grupo (março de 2026). NÃO é data do evento.
+   - Exemplo: cabeçalho "T03 - BH Tipster" → "T03" é temporada 3.
+   - Exemplo: cabeçalho "2026-Q1 GDA Tradicional" → trimestre fiscal, não data.
+   - NUNCA converta "2026.03" em "20/03/2026", "01/03/2026" ou qualquer data. Use a DATA DE HOJE.
+   - A data do evento SÓ sai de texto explícito dentro do bilhete/descrição (ex: "25 Abr 18:30", "Entrada para 23/04/2026", "LIVE").
+
 [R2] CRIAR APOSTA = 1 ITEM SÓ. Detecte Criar Aposta por DUAS VIAS:
 
    VIA A — palavra explícita: se o print tem "CRIAR APOSTA", "BET BUILDER", "ACUMULADOR DO JOGO", "MEU BILHETE" ou "JOGO DO SEU JEITO" escrita explicitamente (geralmente em destaque no topo).
