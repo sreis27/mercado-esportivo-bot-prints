@@ -96,9 +96,9 @@ def extrair_aposta(imagem_bytes, descricao_msg, cadastros, data_hoje, operador_m
     mercados_lista = [m['nome'] for m in cadastros.get('mercados', [])]
     tipos_aposta_lista = [t['nome'] for t in cadastros.get('tipos_aposta', [])]
 
-    prompt = f"""Você é o sistema automatizado de planilhamento do Mercado Esportivo. Opera com julgamento humano.
-
-Analise o PRINT DE APOSTA em anexo combinado com a descrição que o operador adicionou.
+    # Bloco VARIÁVEL — muda a cada chamada (data, cadastros podem ter novos registros, descrição do operador)
+    # Fica fora do cache.
+    contexto_variavel = f"""CONTEXTO DESTA CHAMADA:
 
 QUEM ENVIOU (operador): "{operador_msg or '(desconhecido)'}"
 DESCRIÇÃO: "{descricao_msg or '(sem descrição)'}"
@@ -110,13 +110,18 @@ CADASTROS EXISTENTES — use o nome EXATAMENTE como aparece aqui:
 - Operadores: {json.dumps(operadores_lista, ensure_ascii=False)}
 - Esportes: {json.dumps(esportes_lista, ensure_ascii=False)}
 - Mercados: {json.dumps(mercados_lista, ensure_ascii=False)}
-- Tipos de Aposta: {json.dumps(tipos_aposta_lista, ensure_ascii=False)}
+- Tipos de Aposta: {json.dumps(tipos_aposta_lista, ensure_ascii=False)}"""
+
+    # Bloco FIXO — ~720 linhas de regras que nunca mudam. Vai como system + prompt caching.
+    regras_fixas = """Você é o sistema automatizado de planilhamento do Mercado Esportivo. Opera com julgamento humano.
+
+Analise o PRINT DE APOSTA em anexo combinado com a descrição que o operador adicionou.
 
 ═══════════════════════════════════════════════════════════════
 REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
 ═══════════════════════════════════════════════════════════════
 
-[R1] DATA: só use uma data se estiver ESCRITA EXPLICITAMENTE no print ou na descrição (rótulos "Data:", "Entrada para:", "Jogo em:", ou formato inequívoco DD/MM/AAAA). NUNCA infira data a partir de nomes de grupo, canal, temporada ou temporada-ano. Formatos como "2026.03 [nome]", "T03", "Season X" são IDENTIFICADORES DE GRUPO, NÃO DATAS. Se não há data explícita, use HOJE ({data_hoje}) como fallback. Proibido inventar datas.
+[R1] DATA: só use uma data se estiver ESCRITA EXPLICITAMENTE no print ou na descrição (rótulos "Data:", "Entrada para:", "Jogo em:", ou formato inequívoco DD/MM/AAAA). NUNCA infira data a partir de nomes de grupo, canal, temporada ou temporada-ano. Formatos como "2026.03 [nome]", "T03", "Season X" são IDENTIFICADORES DE GRUPO, NÃO DATAS. Se não há data explícita, use a DATA DE HOJE informada no contexto como fallback. Proibido inventar datas.
 
 [R2] CRIAR APOSTA = 1 ITEM SÓ. Detecte Criar Aposta por DUAS VIAS:
 
@@ -201,7 +206,7 @@ REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
 
 [R7] CHECKLIST FINAL ANTES DE RESPONDER: antes de emitir o JSON, verifique mentalmente:
    - O print tem "CRIAR APOSTA"/"BET BUILDER" escrito OU sinais estruturais de bet builder? → 1 item só. Se NÃO, não invente.
-   - Data que coloquei veio de texto EXPLÍCITO do print/descrição? → Se não, use HOJE ({data_hoje}).
+   - Data que coloquei veio de texto EXPLÍCITO do print/descrição? → Se não, use a DATA DE HOJE do contexto.
    - Times conhecidos? → Esporte marcado (específico se existir, NBA/WNBA/Futebol Feminino/etc).
    - Descrição começa com bookie? → Preenchi o bookie.
    - Palavra após bookie? → Preenchi a conta (CRÍTICO).
@@ -260,8 +265,8 @@ C. ESPORTE: INFIRA por COMBINAÇÃO DE SINAIS (nome de time + mercado + torneio 
 D. DATA DO EVENTO — prioridade de fontes (use a primeira disponível):
    1. DATA EXPLÍCITA NO PRINT: se o print mostra a data em qualquer formato ("21/04/2026", "21 abr", "Data: 2026-04-21 15:45:00", "Entrada para 21/04/2026"), extraia essa data como YYYY-MM-DD.
    2. DATA EXPLÍCITA NA DESCRIÇÃO: se o operador escreveu uma data na descrição, use essa.
-   3. "LIVE" ou "AO VIVO" no print: a partida é HOJE ({data_hoje}).
-   4. Nenhum dos anteriores: use HOJE ({data_hoje}) como fallback.
+   3. "LIVE" ou "AO VIVO" no print: a partida é HOJE (usar DATA DE HOJE do contexto).
+   4. Nenhum dos anteriores: use a DATA DE HOJE do contexto como fallback.
    NUNCA infira data de evento por conhecimento prévio de calendário esportivo — o Claude Vision não tem acesso a dados em tempo real e pode errar. Só use datas que estejam EXPLICITAMENTE escritas no print ou na descrição.
 
    CUIDADO — IDENTIFICADORES DE GRUPO/TEMPORADA NÃO SÃO DATAS: strings em formato "AAAA.MM [texto]", "T[N]", "Season [N]", "[AAAA].[MM] [nome]" no cabeçalho, logo ou nome do canal do tipster são identificadores de grupo/temporada, NÃO são data do evento. Exemplos:
@@ -567,7 +572,7 @@ Responda APENAS com o JSON.
 
 ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
 1. Bet builder? → Print tem "CRIAR APOSTA"/"BET BUILDER" OU sinais estruturais (múltiplas seleções do mesmo jogador/jogo + 1 odd + 1 valor APOSTAR + sem botões individuais + opcionalmente "N Seleções" em destaque)? → 1 item só, tipo "Criar Aposta", entrada concatenada. Se NÃO, não invente.
-2. Data veio de texto EXPLÍCITO do print/descrição? → Se não, use HOJE ({data_hoje}).
+2. Data veio de texto EXPLÍCITO do print/descrição? → Se não, use a DATA DE HOJE do contexto.
 3. Times conhecidos? → Esporte marcado (específico: NBA/WNBA/Futebol Feminino se existir).
 4. Descrição começa com bookie? → Preenchi o bookie (incluindo "365"→Bet365, "AG"→Aposta Ganha).
 5. Palavra após bookie? → Preenchi a conta. Exceto se for palavra qualitativa ("Todas", "Várias") = null mas continua extração.
@@ -583,16 +588,36 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
     resp = client.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=2000,
+        system=[
+            {
+                "type": "text",
+                "text": regras_fixas,
+                "cache_control": {"type": "ephemeral"}
+            }
+        ],
         messages=[{
             "role": "user",
             "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                {"type": "text", "text": prompt}
+                {"type": "text", "text": contexto_variavel}
             ]
         }]
     )
 
     text_raw = resp.content[0].text
+
+    # Log de cache (pra acompanhar economia nos logs do Railway)
+    try:
+        u = resp.usage
+        cache_read = getattr(u, 'cache_read_input_tokens', 0) or 0
+        cache_write = getattr(u, 'cache_creation_input_tokens', 0) or 0
+        inp = getattr(u, 'input_tokens', 0) or 0
+        out = getattr(u, 'output_tokens', 0) or 0
+        status = "HIT" if cache_read > 0 else ("MISS" if cache_write > 0 else "SEM CACHE")
+        print(f"  💰 Cache: {status} | input={inp} cache_read={cache_read} cache_write={cache_write} output={out}")
+    except Exception:
+        pass
+
     text = text_raw.strip()
     text = re.sub(r'^```(?:json)?\s*', '', text)
     text = re.sub(r'\s*```$', '', text)
