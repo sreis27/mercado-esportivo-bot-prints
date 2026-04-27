@@ -87,7 +87,10 @@ def carregar_cadastros():
 
 def extrair_aposta(imagem_bytes, descricao_msg, cadastros, data_hoje, operador_msg=None):
     """Usa Claude Vision pra extrair dados da imagem + descrição da mensagem."""
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    client = anthropic.Anthropic(
+        api_key=ANTHROPIC_KEY,
+        default_headers={"anthropic-beta": "extended-cache-ttl-2025-04-11"}
+    )
 
     tipsters_lista = [t['nome'] for t in cadastros['tipsters']]
     bookies_lista = [b['nome'] for b in cadastros['bookies']]
@@ -599,7 +602,7 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
             {
                 "type": "text",
                 "text": regras_fixas,
-                "cache_control": {"type": "ephemeral"}
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
             }
         ],
         messages=[{
