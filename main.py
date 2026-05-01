@@ -193,11 +193,19 @@ REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
    - Campo mercado = "Múltiplos" se houver mercados variados.
    - Campo esporte = null se houver esportes mistos.
 
-[R9.5] LEGENDA DO TIPSTER É FONTE PRIMÁRIA DE SELEÇÃO. Quando o bilhete mostra múltiplas opções (ex: Resultado Final 1x2 com Bahia 1.80 / Empate 3.60 / Santos 4.50, Over/Under, handicaps) SEM destaque visual de qual foi escolhida, a LEGENDA DO TIPSTER (texto abaixo ou próximo do bilhete) é a ÚNICA fonte confiável da seleção real. Padrão comum: "[seleção] @[odd] / [stake]" ou "[seleção] @[odd]" ou apenas uma linha narrativa tipo "[seleção] vence".
-   - Exemplo: bilhete mostra Bahia 1.80 / Empate 3.60 / Santos 4.50 e legenda diz "Bahia vence @1.80 / 1,25u" → entrada: "Bahia", odd: 1.80, stake_unidades: 1.25, mercado: ML (resultado final).
-   - Exemplo: bilhete Over/Under 2.5 com ambas odds visíveis e legenda "Under 2.5 @1.95 / 0.5u" → entrada: "Under 2.5", odd: 1.95, stake_unidades: 0.5.
-   - Exemplo: bilhete 1x2 sem destaque e legenda "Empate @3.20" → entrada: "Empate", odd: 3.20.
-   NUNCA pegue a primeira odd visível ou a odd maior por default. Se a legenda existe, ELA RESOLVE tudo — entrada, odd e stake saem da linha `@odd / Xu`.
+[R9.5] LEGENDA DO TIPSTER E/OU DESCRIÇÃO DO OPERADOR SÃO FONTES PRIMÁRIAS DE SELEÇÃO. Quando o bilhete mostra múltiplas opções (ex: Resultado Final 1x2 com Bahia 1.80 / Empate 3.60 / Santos 4.50, Over/Under, handicaps) SEM destaque visual de qual foi escolhida, a SELEÇÃO REAL deve sair DUMA destas fontes (em ordem de prioridade):
+   1. **DESCRIÇÃO DO OPERADOR** (mais confiável quando presente). Padrões comuns:
+      - "[bookie] [conta] - [seleção]" (ex: "365 will - bahia")
+      - "[seleção] @[odd]" (ex: "bahia @1.80")
+      - Time/jogador/resultado mencionado claramente entre as palavras-chave do operador.
+   2. **LEGENDA DO TIPSTER** (texto abaixo ou próximo do bilhete). Padrões comuns: "[seleção] @[odd] / [stake]" ou "[seleção] @[odd]" ou linha narrativa "[seleção] vence".
+
+   - Exemplo 1: bilhete mostra Bahia 1.80 / Empate 3.60 / Santos 4.50 e descrição diz "365 will - bahia 1.80" → entrada: "Bahia", odd: 1.80, mercado: ML.
+   - Exemplo 2: bilhete Over/Under 2.5 com ambas odds visíveis e legenda "Under 2.5 @1.95 / 0.5u" → entrada: "Under 2.5", odd: 1.95, stake_unidades: 0.5.
+   - Exemplo 3: bilhete 1x2 sem destaque e legenda "Empate @3.20" → entrada: "Empate", odd: 3.20.
+   - Exemplo 4: bilhete handicap visual mostra opções diferentes e descrição diz "ellian buse -4.5 odd 1.92 - 1u" → entrada: "Buse -4.5", odd: 1.92, stake_unidades: 1, conta: "ellian".
+
+   NUNCA pegue a primeira odd visível, a odd maior, ou a do meio por default. Se há descrição ou legenda, ELA RESOLVE tudo — entrada, odd e stake saem da informação textual.
 
 [R10] STAKE É DADO CRÍTICO — SEMPRE PROCURAR. Extração de stake deve acontecer SEMPRE. Procure em TODA a imagem (bilhete + legenda do tipster + anotações) E na descrição do operador. Padrões comuns que DEVEM ser extraídos:
    - "Xu", "X.Yu" (ex: "1u", "0.5u", "1.25u", "0.75u")
@@ -214,14 +222,42 @@ REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
    
    ATENÇÃO: legendas de tipster frequentemente vêm em formato estruturado com linhas rotuladas tipo "Stake: Xu" / "Odds: Y.YY" / "Min: Z.ZZ". Esses rótulos são FONTE PRIMÁRIA — extraia o valor diretamente da linha rotulada. NUNCA deixe stake em zero quando há "Stake: Xu" ou "Xu" sozinho em linha no texto da mensagem.
 
+[R11] OVERRIDE EXPLÍCITO NA DESCRIÇÃO — "SOMENTE / APENAS / SÓ":
+   Quando a descrição do operador contém uma instrução explícita restringindo o tipo de aposta a registrar, essa instrução TEM PRIORIDADE ABSOLUTA sobre qualquer detecção visual e prevalece sobre R2, Cenário 2 e Cenário 4.
+
+   PADRÕES QUE DISPARAM A REGRA (case-insensitive, considerar variações):
+   - "SOMENTE [tipo]", "APENAS [tipo]", "SÓ [tipo]", "só [tipo]"
+   - "[tipo] aqui", "registrar só [tipo]", "anotar só [tipo]"
+   - Onde [tipo] ∈ {dupla, tripla, múltipla, combinada, individuais, individual, simples}
+
+   COMPORTAMENTO:
+   - "SOMENTE dupla" / "apenas dupla" / "só a dupla" / "registrar só a dupla" → retornar APENAS 1 aposta tipo Dupla. NÃO criar simples individuais. NÃO criar com stake zero. As seleções individuais NÃO ENTRAM na resposta de jeito nenhum.
+   - "SOMENTE tripla" / "só tripla" → APENAS 1 aposta tipo Tripla.
+   - "SOMENTE múltipla" / "só a múltipla" / "só combinada" → APENAS 1 aposta tipo Múltipla / Dupla / Tripla (conforme número de seleções).
+   - "SOMENTE individuais" / "só simples" / "só as individuais" → ignora a combinada, retorna SÓ as N apostas simples.
+
+   EXEMPLO REAL (bilhete BH CS):
+   Bilhete mostra: Snayder Porozo @3.75 + Adalid Terrazas @4.33 + Dupla @16.25 com R$ 90,00 apostado.
+   Descrição do operador: "365 luis / MM Staking / apenas dupla aqui"
+   → Retornar EXATAMENTE 1 aposta:
+     {{"tipo_aposta": "Dupla", "evento": "Dupla", "entrada": "Snayder Porozo + Adalid Terrazas", "odd": 16.25, "stake_reais": 90, "contas_utilizadas": "luis"}}
+   → NUNCA criar duas Simples adicionais (com stake 0 ou qualquer valor). A descrição é override explícito.
+
+   QUANDO NÃO HÁ INSTRUÇÃO "SOMENTE/APENAS/SÓ":
+   - A regra R11 não se aplica. Use Cenário 2/4 normal.
+
+   ATENÇÃO: a palavra "só" pode aparecer em outros contextos ("só funcionou no live", "só esse mercado tem"). Aplicar R11 SOMENTE quando "só / apenas / somente" vem ANTES de uma palavra de tipo de aposta (dupla, tripla, múltipla, combinada, individuais, simples).
+
 [R7] CHECKLIST FINAL ANTES DE RESPONDER: antes de emitir o JSON, verifique mentalmente:
+   - Descrição contém "SOMENTE/APENAS/SÓ + [dupla/tripla/múltipla/combinada/simples/individuais]"? → R11 é ABSOLUTA: retornar APENAS o tipo solicitado, ignorar resto.
    - O print tem "CRIAR APOSTA"/"BET BUILDER" escrito OU sinais estruturais de bet builder? → 1 item só. Se NÃO, não invente.
+   - Print tem palavra "DUPLA/TRIPLA/MÚLTIPLA" + odd combinada visível + R$ único apostado? → DEFAULT é 1 aposta combinada (Cenário 4). Só gere individuais separadas se a descrição indicar EXPLICITAMENTE que cada uma foi apostada.
    - Data que coloquei veio de texto EXPLÍCITO do print/descrição? → Se não, use a DATA DE HOJE do contexto.
    - Times conhecidos? → Esporte marcado (específico se existir, NBA/WNBA/Futebol Feminino/etc).
    - Descrição começa com bookie? → Preenchi o bookie.
    - Palavra após bookie? → Preenchi a conta (CRÍTICO).
    - Rótulo da casa no bilhete? → Preenchi o mercado via match semântico.
-   - Bilhete mostra múltiplas opções (1x2, Over/Under) sem destaque visual? → Usei a LEGENDA DO TIPSTER pra definir entrada/odd/stake. Não peguei odd aleatória.
+   - Bilhete mostra múltiplas opções (1x2, Over/Under) sem destaque visual? → Usei a LEGENDA DO TIPSTER **e/ou DESCRIÇÃO DO OPERADOR** pra definir entrada/odd/stake. Não peguei odd aleatória.
    - Legenda do tipster tem "Stake: Xu" ou "Xu" sozinho em linha? → stake_unidades PREENCHIDA (NUNCA zero).
    - Legenda do tipster tem "Odds: X.XX"? → odd PREENCHIDA (NUNCA zero).
    - "Xu" ou "X%" em QUALQUER parte do texto? → Preenchi stake_unidades.
@@ -364,7 +400,9 @@ F3. ODD COM BÔNUS DA CASA: quando o print contém marcadores de bônus explíci
 
 G. QUANTAS APOSTAS RETORNAR — QUATRO CENÁRIOS (CRÍTICO, fonte comum de erro):
 
-   Primeiro, verifique se há MARCADOR EXPLÍCITO DE COMBINADA: o print contém a palavra "DUPLA", "TRIPLA", "MÚLTIPLA", "COMBO", "ACUMULADA", "TRIPLE", "DOUBLE", "ACCUMULATOR" + uma ODD TOTAL calculada + UM ÚNICO valor apostar/valor apostado + UM ÚNICO possível ganho? Se SIM, vá direto pro Cenário 4.
+   ATENÇÃO PRELIMINAR — REGRA R11 SEMPRE PRIMEIRO: se a descrição do operador contém "SOMENTE/APENAS/SÓ + [tipo de aposta]", PARE AQUI e siga R11. Os cenários abaixo só se aplicam quando NÃO há instrução explícita.
+
+   Primeiro, verifique se há MARCADOR EXPLÍCITO DE COMBINADA: o print contém a palavra "DUPLA", "TRIPLA", "MÚLTIPLA", "COMBO", "ACUMULADA", "TRIPLE", "DOUBLE", "ACCUMULATOR" + uma ODD TOTAL calculada + UM ÚNICO valor apostar/valor apostado + UM ÚNICO possível ganho? Se SIM, o DEFAULT é Cenário 4 (1 aposta combinada). Só vá pro Cenário 2 (paralelas) se houver SINAL EXPLÍCITO de que cada individual também foi apostada (ex: descrição lista cada uma com sua própria conta + stake separadamente, ou bilhete mostra múltiplos botões "Apostar"). NA DÚVIDA, é Cenário 4. Combinada com odd combinada visível NUNCA gera as individuais junto, a não ser que o operador explicitamente diga.
 
    Caso contrário, CONTE no print: quantas odds DISTINTAS aparecem? Cada odd é uma potencial aposta.
 
