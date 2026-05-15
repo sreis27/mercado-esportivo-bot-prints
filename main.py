@@ -633,24 +633,43 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
 
     img_b64 = base64.b64encode(imagem_bytes).decode('ascii')
 
-    resp = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=2000,
-        system=[
-            {
-                "type": "text",
-                "text": regras_fixas,
-                "cache_control": {"type": "ephemeral", "ttl": "1h"}
-            }
-        ],
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                {"type": "text", "text": contexto_variavel}
-            ]
-        }]
-    )
+    # Retry com backoff exponencial para erros transitórios da Anthropic API
+    # (529 Overloaded, 429 Rate Limit, 503 Service Unavailable, falhas de conexão)
+    backoffs = [1, 2, 4, 8]  # até 4 retries → 5 tentativas, espera total máx 15s
+    resp = None
+    for tentativa in range(len(backoffs) + 1):
+        try:
+            resp = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=2000,
+                system=[
+                    {
+                        "type": "text",
+                        "text": regras_fixas,
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                    }
+                ],
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                        {"type": "text", "text": contexto_variavel}
+                    ]
+                }]
+            )
+            if tentativa > 0:
+                print(f"  ✅ Sucesso após {tentativa} retry(s)")
+            break
+        except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
+            status = getattr(e, 'status_code', None)
+            retryable = status in (429, 529, 503) or isinstance(e, anthropic.APIConnectionError)
+            if retryable and tentativa < len(backoffs):
+                espera = backoffs[tentativa]
+                cod = status if status else 'conn'
+                print(f"  ⏳ Anthropic erro {cod} — retry #{tentativa+1}/{len(backoffs)} em {espera}s")
+                time.sleep(espera)
+                continue
+            raise
 
     text_raw = resp.content[0].text
 
