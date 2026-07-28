@@ -92,28 +92,30 @@ def extrair_aposta(imagem_bytes, descricao_msg, cadastros, data_hoje, operador_m
         default_headers={"anthropic-beta": "extended-cache-ttl-2025-04-11"}
     )
 
-    tipsters_lista = [t['nome'] for t in cadastros['tipsters']]
-    bookies_lista = [b['nome'] for b in cadastros['bookies']]
-    operadores_lista = [o['nome'] for o in cadastros['operadores']]
-    esportes_lista = [e['nome'] for e in cadastros['esportes']]
-    mercados_lista = [m['nome'] for m in cadastros.get('mercados', [])]
-    tipos_aposta_lista = [t['nome'] for t in cadastros.get('tipos_aposta', [])]
+    # sorted(): ordem estável byte a byte — essencial pro cache do bloco de cadastros bater
+    tipsters_lista = sorted(t['nome'] for t in cadastros['tipsters'])
+    bookies_lista = sorted(b['nome'] for b in cadastros['bookies'])
+    operadores_lista = sorted(o['nome'] for o in cadastros['operadores'])
+    esportes_lista = sorted(e['nome'] for e in cadastros['esportes'])
+    mercados_lista = sorted(m['nome'] for m in cadastros.get('mercados', []))
+    tipos_aposta_lista = sorted(t['nome'] for t in cadastros.get('tipos_aposta', []))
 
-    # Bloco VARIÁVEL — muda a cada chamada (data, cadastros podem ter novos registros, descrição do operador)
-    # Fica fora do cache.
-    contexto_variavel = f"""CONTEXTO DESTA CHAMADA:
-
-QUEM ENVIOU (operador): "{operador_msg or '(desconhecido)'}"
-DESCRIÇÃO: "{descricao_msg or '(sem descrição)'}"
-DATA DE HOJE: {data_hoje}
-
-CADASTROS EXISTENTES — use o nome EXATAMENTE como aparece aqui:
+    # Bloco de CADASTROS — muda raramente (cadastro novo). Vai no system com cache 1h:
+    # sai do preço cheio ($3/M) e entra como cache read ($0,30/M) em ~toda chamada.
+    contexto_cadastros = f"""CADASTROS EXISTENTES — use o nome EXATAMENTE como aparece aqui:
 - Tipsters: {json.dumps(tipsters_lista, ensure_ascii=False)}
 - Bookies: {json.dumps(bookies_lista, ensure_ascii=False)}
 - Operadores: {json.dumps(operadores_lista, ensure_ascii=False)}
 - Esportes: {json.dumps(esportes_lista, ensure_ascii=False)}
 - Mercados: {json.dumps(mercados_lista, ensure_ascii=False)}
 - Tipos de Aposta: {json.dumps(tipos_aposta_lista, ensure_ascii=False)}"""
+
+    # Bloco VARIÁVEL — muda a cada chamada (operador, descrição, data). Fica fora do cache.
+    contexto_variavel = f"""CONTEXTO DESTA CHAMADA:
+
+QUEM ENVIOU (operador): "{operador_msg or '(desconhecido)'}"
+DESCRIÇÃO: "{descricao_msg or '(sem descrição)'}"
+DATA DE HOJE: {data_hoje}"""
 
     # Bloco FIXO — ~720 linhas de regras que nunca mudam. Vai como system + prompt caching.
     regras_fixas = """Você é o sistema automatizado de planilhamento do Mercado Esportivo. Opera com julgamento humano.
@@ -647,6 +649,11 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
                         "type": "text",
                         "text": regras_fixas,
                         "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                    },
+                    {
+                        "type": "text",
+                        "text": contexto_cadastros,
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}
                     }
                 ],
                 messages=[{
@@ -745,6 +752,29 @@ def get_stake_valor(tipster_id, data_evento, stakes):
     cand.sort(key=lambda s: s['vigente_a_partir'], reverse=True)
     return float(cand[0]['valor_reais'])
 
+def validar_linha(ap, linha):
+    """Checagens determinísticas pós-extração. Retorna lista de avisos.
+    Não bloqueia o insert — avisos mudam a reação no Telegram pra chamar conferência humana."""
+    avisos = []
+    if ap.get('tipster') and not linha.get('tipster_id'):
+        avisos.append(f"tipster não cadastrado: '{ap.get('tipster')}'")
+    if ap.get('bookie') and not linha.get('bookie_id'):
+        avisos.append(f"bookie não cadastrada: '{ap.get('bookie')}'")
+    su = linha.get('stake_unidades')
+    sr = linha.get('stake_reais')
+    if su is None and sr is None:
+        avisos.append("sem stake (nem unidades nem R$)")
+    if su is not None and float(su) > 3:
+        avisos.append(f"stake alta ({su}u) — conferir")
+    odd = linha.get('odd')
+    if odd is None:
+        avisos.append("sem odd")
+    elif float(odd) < 1.01:
+        avisos.append(f"odd inválida ({odd})")
+    if not linha.get('evento') and not linha.get('entrada'):
+        avisos.append("sem evento e sem entrada")
+    return avisos
+
 def montar_linha(ap, cadastros):
     """Converte um item do JSON extraído numa linha do Supabase."""
     tipster_id  = find_id(cadastros['tipsters'], ap.get('tipster'))
@@ -833,20 +863,29 @@ def processar_mensagem(msg, cadastros):
 
         # Registra cada aposta no Supabase
         sucesso = 0
+        avisos_total = []
         for ap in apostas:
             try:
                 linha = montar_linha(ap, cadastros)
                 if not linha.get('data_evento'):
                     linha['data_evento'] = data_hoje
+                avisos = validar_linha(ap, linha)
+                if avisos:
+                    for a in avisos:
+                        print(f"  ⚠️ Aviso: {a}")
+                    avisos_total.extend(avisos)
                 sb_insert('apostas', linha)
                 sucesso += 1
             except Exception as e:
                 print(f"  ❌ Erro salvando aposta: {e}")
                 traceback.print_exc()
 
-        if sucesso == len(apostas):
+        if sucesso == len(apostas) and not avisos_total:
             print(f"  ✅ {sucesso} aposta(s) registrada(s)")
             tg_react(msg_id, '🔥')
+        elif sucesso == len(apostas):
+            print(f"  ⚠️ {sucesso} registrada(s) com {len(avisos_total)} aviso(s) — conferir")
+            tg_react(msg_id, '🤨')
         elif sucesso > 0:
             print(f"  ⚠️ {sucesso}/{len(apostas)} apostas registradas")
             tg_react(msg_id, '🤨')
