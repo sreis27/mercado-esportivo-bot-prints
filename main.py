@@ -46,6 +46,17 @@ def sb_insert(table, body):
     r.raise_for_status()
     return r.json()
 
+def sb_delete(table, where):
+    """DELETE com filtro PostgREST, ex: sb_delete('apostas', 'tg_msg_id=eq.123')"""
+    r = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/{table}?{where}",
+        headers=sb_headers(), timeout=30
+    )
+    if not r.ok:
+        print(f"sb_delete erro: {r.status_code} {r.text}")
+    r.raise_for_status()
+    return True
+
 def tg_call(method, **params):
     r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
                       json=params, timeout=30)
@@ -775,7 +786,7 @@ def validar_linha(ap, linha):
         avisos.append("sem evento e sem entrada")
     return avisos
 
-def montar_linha(ap, cadastros):
+def montar_linha(ap, cadastros, tg_msg_id=None):
     """Converte um item do JSON extraído numa linha do Supabase."""
     tipster_id  = find_id(cadastros['tipsters'], ap.get('tipster'))
     bookie_id   = find_id(cadastros['bookies'], ap.get('bookie'))
@@ -810,23 +821,111 @@ def montar_linha(ap, cadastros):
         'bookie_id': bookie_id,
         'contas_utilizadas': ap.get('contas_utilizadas'),
         'status': 'PENDING',
+        'tg_msg_id': tg_msg_id,
     }
     return {k: v for k, v in linha.items() if v is not None}
 
 # ============================================================
 # PROCESSAMENTO DE UMA MENSAGEM
 # ============================================================
+# Correções por reply só valem pra prints registrados a partir desta data
+# (antes disso as apostas não têm tg_msg_id — substituir viraria duplicata).
+CORRECAO_DESDE_TS = 1785283200  # 2026-07-28 00:00 UTC
+
+def processar_correcao(msg, reply, cadastros):
+    """Reprocessa um print a partir de um reply 'corrigir: ...' e SUBSTITUI
+    as apostas que aquele print gerou. Trava: só substitui se todas ainda
+    estiverem PENDING. Prints anteriores à feature não são corrigíveis."""
+    msg_id = msg['message_id']
+    orig_id = reply['message_id']
+    correcao = re.sub(r'^\s*(corrigir|correção|correcao|corrige|fix)\s*[:\-—]?\s*', '',
+                      (msg.get('text') or ''), flags=re.IGNORECASE)
+
+    print(f"\n✏️ Correção da msg #{orig_id} via #{msg_id}: '{correcao[:80]}'")
+    tg_react(msg_id, '👀')
+
+    try:
+        if (reply.get('date') or 0) < CORRECAO_DESDE_TS:
+            print("  ⚠️ Print anterior à feature de correção — sem vínculo confiável, abortando")
+            tg_react(msg_id, '🤔')
+            return
+
+        existentes = sb_get(f"apostas?tg_msg_id=eq.{orig_id}&select=id,status")
+        resolvidas = [a for a in existentes if a.get('status') != 'PENDING']
+        if resolvidas:
+            print(f"  ⚠️ {len(resolvidas)} aposta(s) desse print já resolvidas — correção manual necessária")
+            tg_react(msg_id, '🤔')
+            return
+
+        # Reprocessa o print original com legenda original + correção
+        file_id = reply['photo'][-1]['file_id']
+        img_bytes = tg_get_file_bytes(file_id)
+        if not img_bytes:
+            tg_react(msg_id, '💩')
+            return
+
+        data_hoje = datetime.now(BRT).strftime('%Y-%m-%d')
+        from_user = reply.get('from') or {}
+        fname = (from_user.get('first_name') or from_user.get('username') or '').strip()
+        inicial = fname[:1].upper() if fname else ''
+        operador_nome = {'S': 'Samuel', 'A': 'Amaral', 'D': 'Diego'}.get(inicial, fname)
+
+        caption_orig = reply.get('caption') or ''
+        descricao = (caption_orig + "\n\nCORREÇÃO DO OPERADOR (prevalece sobre tudo acima e sobre o print): "
+                     + correcao).strip()
+
+        resultado = extrair_aposta(img_bytes, descricao, cadastros, data_hoje, operador_nome)
+        apostas = resultado.get('apostas', [])
+        if not apostas:
+            print("  ⚠️ Nenhuma aposta na re-extração — nada substituído")
+            tg_react(msg_id, '🤔')
+            return
+
+        # Substitui: remove as antigas do print e insere as novas com o mesmo vínculo
+        if existentes:
+            sb_delete('apostas', f"tg_msg_id=eq.{orig_id}&status=eq.PENDING")
+            print(f"  🔄 {len(existentes)} aposta(s) antigas removidas")
+
+        sucesso = 0
+        avisos_total = []
+        for ap in apostas:
+            try:
+                linha = montar_linha(ap, cadastros, tg_msg_id=orig_id)
+                if not linha.get('data_evento'):
+                    linha['data_evento'] = data_hoje
+                avisos_total.extend(validar_linha(ap, linha))
+                sb_insert('apostas', linha)
+                sucesso += 1
+            except Exception as e:
+                print(f"  ❌ Erro salvando correção: {e}")
+                traceback.print_exc()
+
+        if sucesso == len(apostas) and not avisos_total:
+            print(f"  ✅ Correção aplicada: {sucesso} aposta(s)")
+            tg_react(msg_id, '🔥')
+        elif sucesso > 0:
+            print(f"  ⚠️ Correção parcial/com avisos: {sucesso}/{len(apostas)}, {len(avisos_total)} aviso(s)")
+            tg_react(msg_id, '🤨')
+        else:
+            tg_react(msg_id, '💩')
+
+    except Exception as e:
+        print(f"  ❌ Exception na correção: {e}")
+        traceback.print_exc()
+        tg_react(msg_id, '💩')
+
 def processar_mensagem(msg, cadastros):
     msg_id = msg['message_id']
     foto = msg.get('photo')
     texto = msg.get('caption') or msg.get('text') or ''
 
     if not foto:
-        # Pode ser resposta a um print — verificar reply_to
+        # Correção por reply: texto respondendo um print, começando com gatilho explícito
         reply = msg.get('reply_to_message')
-        if reply and reply.get('photo'):
-            # Mensagem de texto respondendo um print
-            # TODO: poderia combinar descrição adicional com o print original
+        if reply and reply.get('photo') and texto:
+            gatilhos = ('corrigir', 'correção', 'correcao', 'corrige', 'fix')
+            if texto.strip().lower().startswith(gatilhos):
+                processar_correcao(msg, reply, cadastros)
             return
         return  # Não é print, ignora
 
@@ -866,7 +965,7 @@ def processar_mensagem(msg, cadastros):
         avisos_total = []
         for ap in apostas:
             try:
-                linha = montar_linha(ap, cadastros)
+                linha = montar_linha(ap, cadastros, tg_msg_id=msg_id)
                 if not linha.get('data_evento'):
                     linha['data_evento'] = data_hoje
                 avisos = validar_linha(ap, linha)
