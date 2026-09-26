@@ -88,12 +88,13 @@ def carregar_cadastros():
     Tipsters, bookies e esportes inativos são filtrados (nao aparecem como opcoes)."""
     return {
         'tipsters': sb_get('tipsters?select=id,nome&ativo=eq.true'),
-        'bookies': sb_get('bookies?select=id,nome&ativo=eq.true'),
+        'bookies': sb_get('bookies?select=id,nome,moeda&ativo=eq.true'),
         'operadores': sb_get('operadores?select=id,nome'),
         'esportes': sb_get('esportes?select=id,nome&ativo=eq.true'),
         'mercados': sb_get('mercados?select=id,nome'),
         'tipos_aposta': sb_get('tipos_aposta?select=id,nome'),
         'stakes': sb_get('stakes_historico?select=tipster_id,valor_reais,vigente_a_partir'),
+        'stakes_usd': sb_get('stakes_usd?select=tipster_id,valor_usd,vigente_a_partir'),
     }
 
 def extrair_aposta(imagem_bytes, descricao_msg, cadastros, data_hoje, operador_msg=None):
@@ -607,6 +608,15 @@ L. EXTRAÇÃO DE EVENTO E MERCADO DIRETO DO PRINT: quando o print mostra clarame
      * Se NENHUM mercado da lista corresponder semanticamente, extraia o texto como aparece no print.
      * JAMAIS retornar "ML" literal ou null quando há rótulo explícito da casa no print — sempre tente match semântico primeiro.
 
+U. CASAS EM DÓLAR (ThunderPick, Polymarket e similares):
+   - Marca d'água ou logo da casa no print IDENTIFICA o bookie mesmo sem a descrição citar (ex: marca d'água "THUNDERPICK" → bookie "ThunderPick").
+   - Valor apostado em USD / US$ / $ (ex: "Aposta 50,01 USD") → preencha stake_usd: 50.01 e deixe stake_reais null. NUNCA coloque valor em dólar em stake_reais.
+   - Se além do valor em dólar houver stake em unidades explícita ("1u"), preencha também stake_unidades.
+
+V. APOSTA JÁ RESOLVIDA NO PRINT:
+   - Selo de resultado visível no bilhete define o status: "Ganho"/"Won"/"Vitória" → WON; "Perdido"/"Lost"/"Derrota" → LOST; "Reembolso"/"Devolvida"/"Void"/"Anulada" → VOID; "Cash out"/"Encerrada" com valor antecipado → CASH OUT; "Meio ganho" → HALF WON; "Meia perda" → HALF LOST.
+   - Sem selo de resultado (aposta em aberto) → status null.
+
 FORMATO DE RESPOSTA (JSON puro, sem markdown):
 
 {{
@@ -620,6 +630,8 @@ FORMATO DE RESPOSTA (JSON puro, sem markdown):
       "odd": number ou null,
       "stake_unidades": number ou null,
       "stake_reais": number ou null,
+      "stake_usd": number ou null,
+      "status": "WON|LOST|VOID|HALF WON|HALF LOST|CASH OUT" ou null,
       "tipo_aposta": "nome igual ao cadastro (Simples|Dupla|Tripla|Múltipla|Criar Aposta|Super Aumentada|outros)" ou null,
       "tipster": "nome igual ao cadastro" ou null,
       "operador": "nome igual ao cadastro" ou null,
@@ -642,6 +654,8 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
 8. ODD: descrição tem "odd X.XX" (ou typos "od"/"ood")? → USEI esse valor, NÃO o do print.
 9. "BH" no cabeçalho? → tipster "BH CS" + esporte "Counter-Strike".
 10. Tipo_aposta: 1 seleção sem marcador especial = Simples. Não inventar Criar Aposta.
+11. Valor em USD/US$/$ no bilhete ou marca d'água de casa em dólar? → stake_usd preenchido, stake_reais null, bookie pela marca d'água.
+12. Selo de resultado (Ganho/Perdido/Reembolso...)? → status preenchido. Sem selo → null.
 """
 
     img_b64 = base64.b64encode(imagem_bytes).decode('ascii')
@@ -764,7 +778,7 @@ def extrair_stake_focado(client, imagem_bytes, descricao_msg):
 
 def reforcar_stake(client, resultado, imagem_bytes, descricao_msg):
     aps = (resultado or {}).get('apostas') or []
-    if len(aps) == 1 and aps[0].get('stake_unidades') is None and aps[0].get('stake_reais') is None:
+    if len(aps) == 1 and aps[0].get('stake_unidades') is None and aps[0].get('stake_reais') is None and aps[0].get('stake_usd') is None:
         su = extrair_stake_focado(client, imagem_bytes, descricao_msg)
         if su is not None:
             aps[0]['stake_unidades'] = su
@@ -873,6 +887,16 @@ def get_stake_valor(tipster_id, data_evento, stakes):
     cand.sort(key=lambda s: s['vigente_a_partir'], reverse=True)
     return float(cand[0]['valor_reais'])
 
+def get_stake_valor_usd(tipster_id, data_evento, stakes_usd):
+    if not tipster_id or not data_evento:
+        return None
+    cand = [s for s in (stakes_usd or []) if s['tipster_id'] == tipster_id and s['vigente_a_partir'] <= data_evento]
+    if not cand: return None
+    cand.sort(key=lambda s: s['vigente_a_partir'], reverse=True)
+    return float(cand[0]['valor_usd'])
+
+STATUS_VALIDOS = {'WON', 'LOST', 'VOID', 'HALF WON', 'HALF LOST', 'CASH OUT'}
+
 def validar_linha(ap, linha):
     """Checagens determinísticas pós-extração. Retorna lista de avisos.
     Não bloqueia o insert — avisos mudam a reação no Telegram pra chamar conferência humana."""
@@ -883,8 +907,10 @@ def validar_linha(ap, linha):
         avisos.append(f"bookie não cadastrada: '{ap.get('bookie')}'")
     su = linha.get('stake_unidades')
     sr = linha.get('stake_reais')
-    if su is None and sr is None:
-        avisos.append("sem stake (nem unidades nem R$)")
+    if su is None and sr is None and linha.get('stake_usd') is None:
+        avisos.append("sem stake (nem unidades nem R$/US$)")
+    if linha.get('moeda') == 'USD' and linha.get('stake_usd') is not None and su is None:
+        avisos.append("aposta em US$ sem stake US$ cadastrada pro tipster — unidades não calculadas")
     if su is not None and float(su) > 3:
         avisos.append(f"stake alta ({su}u) — conferir")
     odd = linha.get('odd')
@@ -905,16 +931,34 @@ def montar_linha(ap, cadastros, tg_msg_id=None):
 
     su = ap.get('stake_unidades')
     sr = ap.get('stake_reais')
+    su_usd = ap.get('stake_usd')
     data_ev = ap.get('data_evento')
 
-    # Conversão bidirecional: se tem uma ponta + valor da unidade, calcula a outra
-    if tipster_id and data_ev:
+    # Moeda: valor em dólar no print OU casa marcada como USD no cadastro
+    moeda_casa = next((b.get('moeda') for b in cadastros['bookies'] if b['id'] == bookie_id), 'BRL') if bookie_id else 'BRL'
+    moeda = 'USD' if (su_usd or moeda_casa == 'USD') else 'BRL'
+
+    if moeda == 'USD':
+        if not su_usd and sr:          # modelo pôs o valor em dólar no campo de reais
+            su_usd, sr = sr, None
+        sr = None
+        svu = get_stake_valor_usd(tipster_id, data_ev, cadastros.get('stakes_usd'))
+        if svu:
+            if su_usd and not su:
+                su = round(su_usd / svu, 4)
+            elif su and not su_usd:
+                su_usd = round(su * svu, 2)
+    # Conversão bidirecional em R$: se tem uma ponta + valor da unidade, calcula a outra
+    elif tipster_id and data_ev:
         sv = get_stake_valor(tipster_id, data_ev, cadastros['stakes'])
         if sv:
             if su and not sr:
                 sr = su * sv
             elif sr and not su:
                 su = round(sr / sv, 2)
+
+    status = (ap.get('status') or '').upper().strip()
+    status = status if status in STATUS_VALIDOS else 'PENDING'
 
     linha = {
         'data_evento': data_ev,
@@ -925,12 +969,14 @@ def montar_linha(ap, cadastros, tg_msg_id=None):
         'odd': ap.get('odd'),
         'stake_unidades': su,
         'stake_reais': sr,
+        'stake_usd': su_usd,
+        'moeda': moeda,
         'tipo_aposta': ap.get('tipo_aposta'),
         'tipster_id': tipster_id,
         'operador_id': operador_id,
         'bookie_id': bookie_id,
         'contas_utilizadas': ap.get('contas_utilizadas'),
-        'status': 'PENDING',
+        'status': status,
         'tg_msg_id': tg_msg_id,
     }
     return {k: v for k, v in linha.items() if v is not None}
@@ -1000,7 +1046,9 @@ def processar_correcao(msg, reply, cadastros):
         avisos_total = []
         for ap in apostas:
             try:
-                ap['data_evento'] = normalizar_data_evento(ap.get('data_evento') or data_hoje, data_hoje, descricao)
+                ap['data_evento'] = ap.get('data_evento') or data_hoje
+                if (ap.get('status') or '').upper() not in STATUS_VALIDOS:
+                    ap['data_evento'] = normalizar_data_evento(ap['data_evento'], data_hoje, descricao)
                 if not ap.get('bookie'):
                     ap['bookie'] = bookie_da_descricao(descricao.split('CORREÇÃO DO OPERADOR')[-1], cadastros)
                 linha = montar_linha(ap, cadastros, tg_msg_id=orig_id)
@@ -1081,7 +1129,9 @@ def processar_mensagem(msg, cadastros):
         avisos_total = []
         for ap in apostas:
             try:
-                ap['data_evento'] = normalizar_data_evento(ap.get('data_evento') or data_hoje, data_hoje, texto)
+                ap['data_evento'] = ap.get('data_evento') or data_hoje
+                if (ap.get('status') or '').upper() not in STATUS_VALIDOS:
+                    ap['data_evento'] = normalizar_data_evento(ap['data_evento'], data_hoje, texto)
                 if not ap.get('bookie'):
                     ap['bookie'] = bookie_da_descricao(texto, cadastros)
                     if ap['bookie']:
