@@ -721,11 +721,76 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
             return {'apostas': []}
 
     try:
-        return json.loads(text)
+        resultado = json.loads(text)
     except json.JSONDecodeError as e:
         print(f"  ⚠️ JSONDecodeError: {e}")
         print(f"     Texto: {text[:500]}")
         return {'apostas': []}
+    return reforcar_stake(client, resultado, imagem_bytes, descricao_msg)
+
+
+# ============================================================
+# REFORÇO DE STAKE — 2ª chamada curta e focada quando a extração
+# principal devolve stake nula num print de aposta única.
+# (o prompt principal é longo; uma pergunta isolada acerta muito mais)
+# ============================================================
+PROMPT_STAKE = (
+    "Esta imagem é o print de uma aposta esportiva enviada por um tipster, seguida da descrição do operador.\n"
+    "Qual a STAKE em UNIDADES indicada? Procure em QUALQUER parte da imagem (bilhete, legenda abaixo, texto do tipster) "
+    "e na descrição padrões como: \"(1u)\", \"1u\", \"0.5u\", \"@ 1.73 (1u)\", \"/ 0.75u\", \"Stake: 1\", \"2%\" (% = unidade).\n"
+    "IGNORE odds (ex: 1.735), handicaps (ex: -0.25), 'Min' de odd mínima e campos vazios de Stake/Win da interface da casa.\n"
+    "Responda APENAS com JSON: {\"stake_unidades\": numero ou null}. Use null só se não houver NENHUM número ligado a u/%/stake."
+)
+
+def extrair_stake_focado(client, imagem_bytes, descricao_msg):
+    try:
+        img_b64 = base64.b64encode(imagem_bytes).decode('ascii')
+        r = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=60,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                {"type": "text", "text": PROMPT_STAKE + f"\n\nDESCRIÇÃO DO OPERADOR: \"{descricao_msg or '(sem descrição)'}\""},
+            ]}],
+        )
+        raw = r.content[0].text.strip()
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        val = json.loads(m.group(0)).get('stake_unidades') if m else None
+        if isinstance(val, (int, float)) and 0 < val <= 50:
+            return float(val)
+    except Exception as e:
+        print(f"  ⚠️ Reforço de stake falhou: {e}", flush=True)
+    return None
+
+def reforcar_stake(client, resultado, imagem_bytes, descricao_msg):
+    aps = (resultado or {}).get('apostas') or []
+    if len(aps) == 1 and aps[0].get('stake_unidades') is None and aps[0].get('stake_reais') is None:
+        su = extrair_stake_focado(client, imagem_bytes, descricao_msg)
+        if su is not None:
+            aps[0]['stake_unidades'] = su
+            print(f"  🎯 Stake recuperada no reforço: {su}u", flush=True)
+        else:
+            print("  🎯 Reforço de stake: nenhuma stake encontrada", flush=True)
+    return resultado
+
+# ============================================================
+# TRAVA DE DATA — aposta encaminhada hoje não pode cair no passado
+# Exceções: operador escreveu data ("24/09") ou "ontem" na descrição
+# (registro retroativo proposital) e madrugada até 06h BRT aceitando
+# o dia anterior (jogo da noite anterior ainda em andamento).
+# ============================================================
+RE_DATA_DESC = re.compile(r'\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b|\bontem\b|\banteontem\b', re.IGNORECASE)
+
+def normalizar_data_evento(data_ev, data_hoje, descricao):
+    if not data_ev or data_ev >= data_hoje:
+        return data_ev
+    if descricao and RE_DATA_DESC.search(descricao):
+        return data_ev
+    agora = datetime.now(BRT)
+    if agora.hour < 6 and data_ev == (agora - timedelta(days=1)).strftime('%Y-%m-%d'):
+        return data_ev
+    print(f"  📅 data_evento {data_ev} no passado → ajustada pra {data_hoje}", flush=True)
+    return data_hoje
 
 # ============================================================
 # CONVERTE DADOS EXTRAÍDOS → LINHA DO SUPABASE
@@ -890,6 +955,7 @@ def processar_correcao(msg, reply, cadastros):
         avisos_total = []
         for ap in apostas:
             try:
+                ap['data_evento'] = normalizar_data_evento(ap.get('data_evento') or data_hoje, data_hoje, descricao)
                 linha = montar_linha(ap, cadastros, tg_msg_id=orig_id)
                 if not linha.get('data_evento'):
                     linha['data_evento'] = data_hoje
@@ -965,6 +1031,7 @@ def processar_mensagem(msg, cadastros):
         avisos_total = []
         for ap in apostas:
             try:
+                ap['data_evento'] = normalizar_data_evento(ap.get('data_evento') or data_hoje, data_hoje, texto)
                 linha = montar_linha(ap, cadastros, tg_msg_id=msg_id)
                 if not linha.get('data_evento'):
                     linha['data_evento'] = data_hoje
