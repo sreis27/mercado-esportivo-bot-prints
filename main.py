@@ -774,6 +774,51 @@ def reforcar_stake(client, resultado, imagem_bytes, descricao_msg):
     return resultado
 
 # ============================================================
+# BOOKIE PELA DESCRIÇÃO — fallback determinístico quando o modelo
+# devolve bookie null mesmo com a casa escrita na 1ª linha ("22bet")
+# ============================================================
+ALIASES_BOOKIE = {'365': 'bet365', 'ag': 'aposta ganha'}
+
+def bookie_da_descricao(descricao, cadastros):
+    if not descricao or not descricao.strip():
+        return None
+    nomes = {b['nome'].lower(): b['nome'] for b in cadastros['bookies']}
+    primeira = descricao.strip().splitlines()[0].strip().lower()
+    for c in [primeira] + primeira.split()[:3]:
+        c = ALIASES_BOOKIE.get(c.strip('.,;:'), c.strip('.,;:'))
+        if c in nomes:
+            return nomes[c]
+    return None
+
+# ============================================================
+# TEXTOS EXTRAS DA MENSAGEM — citação/resposta podem carregar o texto
+# do tipster (ex: "@ 1.746 (1u)") fora da imagem e fora da legenda
+# ============================================================
+def textos_extras(msg):
+    partes = []
+    q = (msg.get('quote') or {}).get('text')
+    if q: partes.append(q)
+    rt = msg.get('reply_to_message') or {}
+    t = rt.get('caption') or rt.get('text')
+    if t: partes.append(t)
+    return '\n'.join(partes)
+
+def log_estrutura(msg):
+    try:
+        p = (msg.get('photo') or [{}])[-1]
+        info = {
+            'keys': sorted(k for k in msg.keys() if k not in ('photo', 'from', 'chat')),
+            'foto': f"{p.get('width')}x{p.get('height')} {p.get('file_size')}B",
+            'quote': ((msg.get('quote') or {}).get('text') or '')[:120],
+            'reply_caption': (((msg.get('reply_to_message') or {}).get('caption')) or '')[:120],
+            'external_reply': sorted((msg.get('external_reply') or {}).keys()),
+            'forward_origin': (msg.get('forward_origin') or {}).get('type'),
+        }
+        print(f"  🔎 Estrutura: {json.dumps(info, ensure_ascii=False)}", flush=True)
+    except Exception as e:
+        print(f"  🔎 log_estrutura falhou: {e}", flush=True)
+
+# ============================================================
 # TRAVA DE DATA — aposta encaminhada hoje não pode cair no passado
 # Exceções: operador escreveu data ("24/09") ou "ontem" na descrição
 # (registro retroativo proposital) e madrugada até 06h BRT aceitando
@@ -956,6 +1001,8 @@ def processar_correcao(msg, reply, cadastros):
         for ap in apostas:
             try:
                 ap['data_evento'] = normalizar_data_evento(ap.get('data_evento') or data_hoje, data_hoje, descricao)
+                if not ap.get('bookie'):
+                    ap['bookie'] = bookie_da_descricao(descricao.split('CORREÇÃO DO OPERADOR')[-1], cadastros)
                 linha = montar_linha(ap, cadastros, tg_msg_id=orig_id)
                 if not linha.get('data_evento'):
                     linha['data_evento'] = data_hoje
@@ -999,6 +1046,9 @@ def processar_mensagem(msg, cadastros):
     file_id = foto[-1]['file_id']
 
     print(f"\n📸 Processando msg #{msg_id}: '{texto[:80]}'")
+    log_estrutura(msg)
+    extras = textos_extras(msg)
+    texto_modelo = texto + (f"\n\nTEXTO ORIGINAL DO TIPSTER (mensagem citada/encaminhada): {extras}" if extras else '')
 
     # Marca como processando
     tg_react(msg_id, '👀')
@@ -1018,7 +1068,7 @@ def processar_mensagem(msg, cadastros):
         mapa_operador = {'S': 'Samuel', 'A': 'Amaral', 'D': 'Diego'}
         operador_nome = mapa_operador.get(inicial, fname)
         print(f"  👤 from='{fname}' → inicial='{inicial}' → operador='{operador_nome}'")
-        resultado = extrair_aposta(img_bytes, texto, cadastros, data_hoje, operador_nome)
+        resultado = extrair_aposta(img_bytes, texto_modelo, cadastros, data_hoje, operador_nome)
 
         apostas = resultado.get('apostas', [])
         if not apostas:
@@ -1032,6 +1082,10 @@ def processar_mensagem(msg, cadastros):
         for ap in apostas:
             try:
                 ap['data_evento'] = normalizar_data_evento(ap.get('data_evento') or data_hoje, data_hoje, texto)
+                if not ap.get('bookie'):
+                    ap['bookie'] = bookie_da_descricao(texto, cadastros)
+                    if ap['bookie']:
+                        print(f"  🏦 Bookie pela descrição: {ap['bookie']}", flush=True)
                 linha = montar_linha(ap, cadastros, tg_msg_id=msg_id)
                 if not linha.get('data_evento'):
                     linha['data_evento'] = data_hoje
