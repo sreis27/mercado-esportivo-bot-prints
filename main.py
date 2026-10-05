@@ -617,6 +617,12 @@ V. APOSTA JÁ RESOLVIDA NO PRINT:
    - Selo de resultado visível no bilhete define o status: "Ganho"/"Won"/"Vitória" → WON; "Perdido"/"Lost"/"Derrota" → LOST; "Reembolso"/"Devolvida"/"Void"/"Anulada" → VOID; "Cash out"/"Encerrada" com valor antecipado → CASH OUT; "Meio ganho" → HALF WON; "Meia perda" → HALF LOST.
    - Sem selo de resultado (aposta em aberto) → status null.
 
+W. DÚVIDAS (o operador lê na hora, no Telegram, e corrige):
+   - Se algum campo que você preencheu PODE ESTAR ERRADO — número borrado ou cortado, dois valores possíveis, informação que você precisou supor — escreva em "duvidas" da própria aposta: no máximo 2 itens, cada um com até 90 caracteres, começando pelo campo e dizendo o que você assumiu. Exemplos: "odd: li 1.66, pode ser 1.68" · "stake: '1' sem 'u', assumi 1u" · "casa: sem marca d'água, usei a 1ª linha da descrição" · "entrada: bilhete cortado, não vi a linha do handicap".
+   - NÃO registre dúvida sobre o que você leu com clareza, nem por falta de data no print (usar a DATA DE HOJE é o padrão). Dúvida de data só quando o print indica outro dia ("Amanhã", "Tomorrow", dia da semana, data incompleta).
+   - Sem dúvida real → "duvidas": []. Na dúvida se é dúvida, não registre.
+   - Se NÃO encontrou nenhuma aposta, explique o motivo em "duvida_geral" (até 120 caracteres; ex.: "print mostra só o saldo da conta", "imagem cortada: não aparece seleção nem odd"). Se encontrou aposta, "duvida_geral": null.
+
 FORMATO DE RESPOSTA (JSON puro, sem markdown):
 
 {{
@@ -636,9 +642,11 @@ FORMATO DE RESPOSTA (JSON puro, sem markdown):
       "tipster": "nome igual ao cadastro" ou null,
       "operador": "nome igual ao cadastro" ou null,
       "bookie": "nome igual ao cadastro" ou null,
-      "contas_utilizadas": "separadas por vírgula" ou null
+      "contas_utilizadas": "separadas por vírgula" ou null,
+      "duvidas": ["campo: o que você assumiu"] ou []
     }}
-  ]
+  ],
+  "duvida_geral": "motivo de não ter achado aposta" ou null
 }}
 
 Responda APENAS com o JSON.
@@ -656,6 +664,7 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
 10. Tipo_aposta: 1 seleção sem marcador especial = Simples. Não inventar Criar Aposta.
 11. Valor em USD/US$/$ no bilhete ou marca d'água de casa em dólar? → stake_usd preenchido, stake_reais null, bookie pela marca d'água.
 12. Selo de resultado (Ganho/Perdido/Reembolso...)? → status preenchido. Sem selo → null.
+13. Algum campo pode estar errado (leitura ambígua, valor suposto)? → "duvidas" da aposta (máx 2). Nenhuma aposta achada → "duvida_geral" com o motivo.
 """
 
     img_b64 = base64.b64encode(imagem_bytes).decode('ascii')
@@ -900,27 +909,233 @@ STATUS_VALIDOS = {'WON', 'LOST', 'VOID', 'HALF WON', 'HALF LOST', 'CASH OUT'}
 def validar_linha(ap, linha):
     """Checagens determinísticas pós-extração. Retorna lista de avisos.
     Não bloqueia o insert — avisos mudam a reação no Telegram pra chamar conferência humana."""
+    # Textos vão pro log E pra resposta no Telegram: dizer o que faltou e o que fazer.
     avisos = []
     if ap.get('tipster') and not linha.get('tipster_id'):
-        avisos.append(f"tipster não cadastrado: '{ap.get('tipster')}'")
+        avisos.append(f"tipster '{ap.get('tipster')}' não está no cadastro — ficou sem tipster")
+    elif not linha.get('tipster_id'):
+        avisos.append("não identifiquei o tipster")
     if ap.get('bookie') and not linha.get('bookie_id'):
-        avisos.append(f"bookie não cadastrada: '{ap.get('bookie')}'")
+        avisos.append(f"casa '{ap.get('bookie')}' não está no cadastro — ficou sem casa")
+    elif not linha.get('bookie_id'):
+        avisos.append("não identifiquei a casa (sem marca d'água nem nome na legenda)")
     su = linha.get('stake_unidades')
     sr = linha.get('stake_reais')
     if su is None and sr is None and linha.get('stake_usd') is None:
-        avisos.append("sem stake (nem unidades nem R$/US$)")
+        avisos.append("sem stake: não achei unidade nem valor no print/legenda")
     if linha.get('moeda') == 'USD' and linha.get('stake_usd') is not None and su is None:
-        avisos.append("aposta em US$ sem stake US$ cadastrada pro tipster — unidades não calculadas")
+        avisos.append("aposta em US$ e o tipster não tem valor da unidade em US$ cadastrado — unidades em branco")
     if su is not None and float(su) > 3:
-        avisos.append(f"stake alta ({su}u) — conferir")
+        avisos.append(f"stake alta ({fmt_num(su)}u) — confere")
     odd = linha.get('odd')
     if odd is None:
         avisos.append("sem odd")
     elif float(odd) < 1.01:
         avisos.append(f"odd inválida ({odd})")
     if not linha.get('evento') and not linha.get('entrada'):
-        avisos.append("sem evento e sem entrada")
+        avisos.append("não li o evento nem a entrada")
     return avisos
+
+# ============================================================
+# RESPOSTA NO TELEGRAM — o bot responde o próprio print quando algo
+# não foi registrado, ficou faltando ou ele teve dúvida. Print ok = só 🔥.
+# ============================================================
+def fmt_num(v):
+    """1.0 → '1' · 0.75 → '0,75' · 40.0 → '40'"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    s = f"{f:.2f}".rstrip('0').rstrip('.')
+    return s.replace('.', ',')
+
+def resumo_aposta(linha, cadastros):
+    """'Rooster +1.5 mapas @1.66 · ThunderPick · 0,8u' — o suficiente pra achar a aposta."""
+    casa = next((b['nome'] for b in cadastros['bookies'] if b['id'] == linha.get('bookie_id')), None)
+    ent = (linha.get('entrada') or linha.get('evento') or '?').strip()
+    if len(ent) > 48:
+        ent = ent[:47] + '…'
+    partes = [ent + (f" @{linha['odd']}" if linha.get('odd') else '')]
+    if casa:
+        partes.append(casa)
+    su, sd, sr = linha.get('stake_unidades'), linha.get('stake_usd'), linha.get('stake_reais')
+    if su is not None:
+        partes.append(f"{fmt_num(su)}u")
+    elif sd is not None:
+        partes.append(f"US$ {fmt_num(sd)}")
+    elif sr is not None:
+        partes.append(f"R$ {fmt_num(sr)}")
+    return ' · '.join(partes)
+
+def limpar_duvidas(lista):
+    out = []
+    for d in (lista or []):
+        if isinstance(d, str) and d.strip():
+            d = d.strip()
+            out.append(d if len(d) <= 100 else d[:99] + '…')
+    return out[:2]
+
+def novo_relatorio():
+    # itens: apostas gravadas {'resumo','avisos','duvidas'} · falhas: não gravadas {'resumo','erro'}
+    return {'itens': [], 'falhas': [], 'duvida_geral': None}
+
+def texto_resposta(orig_id, rel, correcao=False):
+    """Texto da resposta no Telegram, ou None quando não há nada a dizer (print ok)."""
+    itens, falhas = rel['itens'], rel['falhas']
+    dica = "↩️ Pra corrigir, responda esta mensagem com: corrigir: <o que mudar>"
+
+    if not itens and not falhas:
+        cab = (f"🤔 #{orig_id} · mesmo com a correção não achei aposta nesse print — nada foi alterado."
+               if correcao else f"🤔 #{orig_id} · não achei aposta nesse print.")
+        linhas = [cab]
+        if rel.get('duvida_geral'):
+            linhas.append(f"💭 {rel['duvida_geral']}")
+        linhas += ["", "↩️ Se for aposta, responda esta mensagem com: corrigir: casa, entrada, odd, stake"]
+        return '\n'.join(linhas)
+
+    com_problema = [i for i in itens if i['avisos'] or i['duvidas']]
+    if not com_problema and not falhas:
+        if not correcao:
+            return None
+        n = len(itens)
+        return '\n'.join([f"✅ #{orig_id} · corrigido, {n} aposta{'s' if n != 1 else ''}:"]
+                         + [f"• {i['resumo']}" for i in itens])
+
+    n = len(itens)
+    if falhas:
+        cab = f"🤨 #{orig_id} · registrei {n} de {n + len(falhas)}, confere:"
+    elif correcao:
+        cab = f"🤨 #{orig_id} · correção aplicada ({n} aposta{'s' if n != 1 else ''}), ainda confere:"
+    else:
+        cab = f"🤨 #{orig_id} · registrei {n} aposta{'s' if n != 1 else ''}, confere:"
+    linhas = [cab]
+    for i in com_problema:
+        linhas.append(f"• {i['resumo']}")
+        linhas += [f"   ⚠️ {a}" for a in i['avisos']]
+        linhas += [f"   💭 {d}" for d in i['duvidas']]
+    for f in falhas:
+        linhas.append(f"• {f['resumo']}")
+        linhas.append(f"   ❌ não foi registrada: {f['erro']}")
+    n_ok = n - len(com_problema)
+    if n_ok:
+        linhas.append(f"(as outras {n_ok} ficaram ok)" if n_ok > 1 else "(a outra ficou ok)")
+    linhas += ["", dica]
+    return '\n'.join(linhas)
+
+def tg_reply(reply_to_id, texto):
+    """Responde no grupo citando a mensagem (quem mandou é notificado). Texto puro, sem parse_mode.
+    Devolve o message_id da resposta (ou None)."""
+    if not texto:
+        return None
+    params = dict(chat_id=CHAT_ID, text=texto[:4000],
+                  reply_parameters={'message_id': reply_to_id, 'allow_sending_without_reply': True},
+                  link_preview_options={'is_disabled': True})
+    for tentativa in range(2):
+        try:
+            r = tg_call('sendMessage', **params)
+        except Exception as e:
+            print(f"  ⚠️ sendMessage erro: {e}", flush=True)
+            return None
+        if r.get('ok'):
+            return r['result']['message_id']
+        espera = (r.get('parameters') or {}).get('retry_after')
+        if r.get('error_code') == 429 and espera and tentativa == 0:
+            time.sleep(min(int(espera), 15))
+            continue
+        print(f"  ⚠️ sendMessage falhou: {r.get('description')}", flush=True)
+        return None
+    return None
+
+# ============================================================
+# LOG DE PRINTS (tabela prints_log) — 1 linha por print recebido
+# ============================================================
+def sb_upsert(table, body, on_conflict):
+    h = sb_headers()
+    h['Prefer'] = 'resolution=merge-duplicates,return=minimal'
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/{table}?on_conflict={on_conflict}",
+                      headers=h, json=body, timeout=30)
+    if not r.ok:
+        print(f"sb_upsert erro: {r.status_code} {r.text}")
+    r.raise_for_status()
+
+def log_print(dados):
+    """Nunca derruba o processamento: log é best-effort."""
+    try:
+        sb_upsert('prints_log', dados, 'tg_msg_id')
+    except Exception as e:
+        print(f"  ⚠️ prints_log: {e}", flush=True)
+
+def avisos_do_relatorio(rel):
+    out = []
+    for i in rel['itens']:
+        out += i['avisos'] + [f"dúvida — {d}" for d in i['duvidas']]
+    out += [f"não registrada: {f['erro']}" for f in rel['falhas']]
+    if rel.get('duvida_geral'):
+        out.append(f"sem aposta — {rel['duvida_geral']}")
+    return out
+
+def resultado_do_relatorio(rel):
+    if not rel['itens'] and not rel['falhas']:
+        return 'sem_aposta'
+    if not rel['itens']:
+        return 'erro'
+    if rel['falhas'] or any(i['avisos'] or i['duvidas'] for i in rel['itens']):
+        return 'aviso'
+    return 'ok'
+
+def iso_epoch(ts):
+    try:
+        return datetime.fromtimestamp(int(ts), timezone.utc).isoformat()
+    except Exception:
+        return None
+
+def _norm_caption(s):
+    return re.sub(r'\s+', ' ', (s or '').strip().lower())
+
+def print_repetido(operador, caption, foto):
+    """Mesmo operador mandou a mesma imagem com a mesma legenda nos últimos 10 min e ela já virou aposta?
+    Devolve o tg_msg_id do original (ou None). Reenvio de print que deu erro/🤔 não conta como repetido."""
+    try:
+        desde = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        rows = sb_get("prints_log?select=tg_msg_id,caption,file_unique_id,foto_w,foto_h,foto_bytes"
+                      f"&operador=eq.{requests.utils.quote(operador or '')}"
+                      f"&recebido_em=gte.{requests.utils.quote(desde)}"
+                      "&n_apostas=gt.0&order=recebido_em.desc&limit=20")
+    except Exception as e:
+        print(f"  ⚠️ checagem de repetido falhou: {e}", flush=True)
+        return None
+    cap = _norm_caption(caption)
+    for r in rows:
+        if _norm_caption(r.get('caption')) != cap:
+            continue
+        mesma_foto = (foto.get('file_unique_id') and r.get('file_unique_id') == foto.get('file_unique_id')) or (
+            foto.get('file_size') and r.get('foto_bytes') == foto.get('file_size')
+            and r.get('foto_w') == foto.get('width') and r.get('foto_h') == foto.get('height'))
+        if mesma_foto:
+            return r['tg_msg_id']
+    return None
+
+def print_original_da_resposta(resposta_bot):
+    """Operador respondeu a MENSAGEM DO BOT (não o print): acha o print pelo '#123' do texto
+    e monta um 'reply' equivalente ao print original pra correção."""
+    m = re.search(r'#(\d+)', resposta_bot.get('text') or '')
+    if not m:
+        return None
+    orig_id = int(m.group(1))
+    try:
+        rows = sb_get(f"prints_log?tg_msg_id=eq.{orig_id}&select=*")
+    except Exception as e:
+        print(f"  ⚠️ prints_log (busca do original): {e}", flush=True)
+        return None
+    if not rows or not rows[0].get('file_id'):
+        return None
+    r = rows[0]
+    try:
+        date = int(datetime.fromisoformat(r['msg_date']).timestamp()) if r.get('msg_date') else 0
+    except Exception:
+        date = 0
+    return {'message_id': orig_id, 'photo': [{'file_id': r['file_id']}], 'caption': r.get('caption') or '',
+            'date': date, 'from': {'first_name': r.get('from_nome') or ''}}
 
 def montar_linha(ap, cadastros, tg_msg_id=None):
     """Converte um item do JSON extraído numa linha do Supabase."""
@@ -988,22 +1203,83 @@ def montar_linha(ap, cadastros, tg_msg_id=None):
 # (antes disso as apostas não têm tg_msg_id — substituir viraria duplicata).
 CORRECAO_DESDE_TS = 1785283200  # 2026-07-28 00:00 UTC
 
+GATILHOS_CORRECAO = ('corrigir', 'correção', 'correcao', 'corrige', 'fix')
+
+def operador_do_from(from_user):
+    """Nome de quem enviou → operador, pela INICIAL do first_name (S = Samuel, A = Amaral, D = Diego)."""
+    from_user = from_user or {}
+    fname = (from_user.get('first_name') or from_user.get('username') or '').strip()
+    inicial = fname[:1].upper() if fname else ''
+    return fname, {'S': 'Samuel', 'A': 'Amaral', 'D': 'Diego'}.get(inicial, fname)
+
+def _fmt_data_br(s):
+    return f"{s[8:10]}/{s[5:7]}" if s and len(s) >= 10 else (s or '?')
+
+def _erro_curto(e):
+    return (str(e).split(' for url')[0].strip() or e.__class__.__name__)[:80]
+
+def registrar_apostas(resultado, tg_msg_id, cadastros, data_hoje, texto_data, texto_bookie):
+    """Grava as apostas extraídas e devolve o relatório: o que entrou (com avisos/dúvidas) e o que falhou."""
+    rel = novo_relatorio()
+    apostas = (resultado or {}).get('apostas') or []
+    if not apostas:
+        dg = (resultado or {}).get('duvida_geral')
+        rel['duvida_geral'] = dg.strip()[:140] if isinstance(dg, str) and dg.strip() else None
+        return rel
+    for ap in apostas:
+        duvidas = limpar_duvidas(ap.get('duvidas'))
+        try:
+            ap['data_evento'] = ap.get('data_evento') or data_hoje
+            if (ap.get('status') or '').upper() not in STATUS_VALIDOS:
+                antes = ap['data_evento']
+                ap['data_evento'] = normalizar_data_evento(antes, data_hoje, texto_data)
+                if ap['data_evento'] != antes:
+                    duvidas.append(f"data: o print dizia {_fmt_data_br(antes)}, registrei hoje ({_fmt_data_br(data_hoje)})")
+            if not ap.get('bookie'):
+                ap['bookie'] = bookie_da_descricao(texto_bookie, cadastros)
+                if ap['bookie']:
+                    print(f"  🏦 Bookie pela descrição: {ap['bookie']}", flush=True)
+            linha = montar_linha(ap, cadastros, tg_msg_id=tg_msg_id)
+            if not linha.get('data_evento'):
+                linha['data_evento'] = data_hoje
+            avisos = validar_linha(ap, linha)
+            for a in avisos:
+                print(f"  ⚠️ Aviso: {a}")
+            for d in duvidas:
+                print(f"  💭 Dúvida: {d}")
+            sb_insert('apostas', linha)
+            rel['itens'].append({'resumo': resumo_aposta(linha, cadastros), 'avisos': avisos, 'duvidas': duvidas})
+        except Exception as e:
+            print(f"  ❌ Erro salvando aposta: {e}")
+            traceback.print_exc()
+            ent = (ap.get('entrada') or ap.get('evento') or '?')[:48]
+            rel['falhas'].append({'resumo': ent + (f" @{ap['odd']}" if ap.get('odd') else ''), 'erro': _erro_curto(e)})
+    return rel
+
+def reagir_pelo_relatorio(msg_id, rel):
+    res = resultado_do_relatorio(rel)
+    tg_react(msg_id, {'ok': '🔥', 'aviso': '🤨', 'sem_aposta': '🤔', 'erro': '💩'}[res])
+    return res
+
 def processar_correcao(msg, reply, cadastros):
     """Reprocessa um print a partir de um reply 'corrigir: ...' e SUBSTITUI
     as apostas que aquele print gerou. Trava: só substitui se todas ainda
-    estiverem PENDING. Prints anteriores à feature não são corrigíveis."""
+    estiverem PENDING. Prints anteriores à feature não são corrigíveis.
+    O resultado volta como resposta à mensagem de correção."""
     msg_id = msg['message_id']
     orig_id = reply['message_id']
     correcao = re.sub(r'^\s*(corrigir|correção|correcao|corrige|fix)\s*[:\-—]?\s*', '',
                       (msg.get('text') or ''), flags=re.IGNORECASE)
+    quem = operador_do_from(msg.get('from'))[1]
 
-    print(f"\n✏️ Correção da msg #{orig_id} via #{msg_id}: '{correcao[:80]}'")
+    print(f"\n✏️ Correção da msg #{orig_id} via #{msg_id} ({quem}): '{correcao[:80]}'")
     tg_react(msg_id, '👀')
 
     try:
         if (reply.get('date') or 0) < CORRECAO_DESDE_TS:
             print("  ⚠️ Print anterior à feature de correção — sem vínculo confiável, abortando")
             tg_react(msg_id, '🤔')
+            tg_reply(msg_id, f"🤔 #{orig_id} · esse print é de antes de 28/07 e não tem vínculo com as apostas — corrige direto no dash.")
             return
 
         existentes = sb_get(f"apostas?tg_msg_id=eq.{orig_id}&select=id,status")
@@ -1011,6 +1287,7 @@ def processar_correcao(msg, reply, cadastros):
         if resolvidas:
             print(f"  ⚠️ {len(resolvidas)} aposta(s) desse print já resolvidas — correção manual necessária")
             tg_react(msg_id, '🤔')
+            tg_reply(msg_id, f"🤔 #{orig_id} · {len(resolvidas)} aposta(s) desse print já foram resolvidas, então não substituo por aqui — corrige no dash.")
             return
 
         # Reprocessa o print original com legenda original + correção
@@ -1018,23 +1295,22 @@ def processar_correcao(msg, reply, cadastros):
         img_bytes = tg_get_file_bytes(file_id)
         if not img_bytes:
             tg_react(msg_id, '💩')
+            tg_reply(msg_id, f"💩 #{orig_id} · não consegui baixar o print original do Telegram — corrige no dash.")
             return
 
         data_hoje = datetime.now(BRT).strftime('%Y-%m-%d')
-        from_user = reply.get('from') or {}
-        fname = (from_user.get('first_name') or from_user.get('username') or '').strip()
-        inicial = fname[:1].upper() if fname else ''
-        operador_nome = {'S': 'Samuel', 'A': 'Amaral', 'D': 'Diego'}.get(inicial, fname)
+        _, operador_nome = operador_do_from(reply.get('from'))
 
         caption_orig = reply.get('caption') or ''
         descricao = (caption_orig + "\n\nCORREÇÃO DO OPERADOR (prevalece sobre tudo acima e sobre o print): "
                      + correcao).strip()
 
         resultado = extrair_aposta(img_bytes, descricao, cadastros, data_hoje, operador_nome)
-        apostas = resultado.get('apostas', [])
-        if not apostas:
+        if not resultado.get('apostas'):
             print("  ⚠️ Nenhuma aposta na re-extração — nada substituído")
             tg_react(msg_id, '🤔')
+            rel = registrar_apostas(resultado, orig_id, cadastros, data_hoje, descricao, '')
+            tg_reply(msg_id, texto_resposta(orig_id, rel, correcao=True))
             return
 
         # Substitui: remove as antigas do print e insere as novas com o mesmo vínculo
@@ -1042,38 +1318,20 @@ def processar_correcao(msg, reply, cadastros):
             sb_delete('apostas', f"tg_msg_id=eq.{orig_id}&status=eq.PENDING")
             print(f"  🔄 {len(existentes)} aposta(s) antigas removidas")
 
-        sucesso = 0
-        avisos_total = []
-        for ap in apostas:
-            try:
-                ap['data_evento'] = ap.get('data_evento') or data_hoje
-                if (ap.get('status') or '').upper() not in STATUS_VALIDOS:
-                    ap['data_evento'] = normalizar_data_evento(ap['data_evento'], data_hoje, descricao)
-                if not ap.get('bookie'):
-                    ap['bookie'] = bookie_da_descricao(descricao.split('CORREÇÃO DO OPERADOR')[-1], cadastros)
-                linha = montar_linha(ap, cadastros, tg_msg_id=orig_id)
-                if not linha.get('data_evento'):
-                    linha['data_evento'] = data_hoje
-                avisos_total.extend(validar_linha(ap, linha))
-                sb_insert('apostas', linha)
-                sucesso += 1
-            except Exception as e:
-                print(f"  ❌ Erro salvando correção: {e}")
-                traceback.print_exc()
-
-        if sucesso == len(apostas) and not avisos_total:
-            print(f"  ✅ Correção aplicada: {sucesso} aposta(s)")
-            tg_react(msg_id, '🔥')
-        elif sucesso > 0:
-            print(f"  ⚠️ Correção parcial/com avisos: {sucesso}/{len(apostas)}, {len(avisos_total)} aviso(s)")
-            tg_react(msg_id, '🤨')
-        else:
-            tg_react(msg_id, '💩')
+        rel = registrar_apostas(resultado, orig_id, cadastros, data_hoje, descricao,
+                                descricao.split('CORREÇÃO DO OPERADOR')[-1])
+        res = reagir_pelo_relatorio(msg_id, rel)
+        print(f"  ✏️ Correção: {len(rel['itens'])} registrada(s), {len(rel['falhas'])} falha(s) → {res}")
+        tg_reply(msg_id, texto_resposta(orig_id, rel, correcao=True))
+        log_print({'tg_msg_id': orig_id, 'resultado': res, 'n_apostas': len(rel['itens']),
+                   'avisos': avisos_do_relatorio(rel),
+                   'corrigido_em': datetime.now(timezone.utc).isoformat(), 'corrigido_por': quem})
 
     except Exception as e:
         print(f"  ❌ Exception na correção: {e}")
         traceback.print_exc()
         tg_react(msg_id, '💩')
+        tg_reply(msg_id, f"💩 #{orig_id} · deu erro na correção ({_erro_curto(e)}) — tenta de novo ou corrige no dash.")
 
 def processar_mensagem(msg, cadastros):
     msg_id = msg['message_id']
@@ -1081,20 +1339,45 @@ def processar_mensagem(msg, cadastros):
     texto = msg.get('caption') or msg.get('text') or ''
 
     if not foto:
-        # Correção por reply: texto respondendo um print, começando com gatilho explícito
+        # Correção: texto começando com "corrigir" respondendo o PRINT ou a MENSAGEM DO BOT sobre ele
         reply = msg.get('reply_to_message')
-        if reply and reply.get('photo') and texto:
-            gatilhos = ('corrigir', 'correção', 'correcao', 'corrige', 'fix')
-            if texto.strip().lower().startswith(gatilhos):
-                processar_correcao(msg, reply, cadastros)
-            return
-        return  # Não é print, ignora
+        if not (reply and texto and texto.strip().lower().startswith(GATILHOS_CORRECAO)):
+            return  # não é print nem correção, ignora
+        if reply.get('photo'):
+            processar_correcao(msg, reply, cadastros)
+        elif (reply.get('from') or {}).get('is_bot'):
+            orig = print_original_da_resposta(reply)
+            if orig:
+                processar_correcao(msg, orig, cadastros)
+            else:
+                tg_react(msg_id, '🤔')
+                tg_reply(msg_id, "🤔 Não achei o print dessa mensagem. Responde direto no print com: corrigir: ...")
+        return
 
-    # Pega a maior resolução
-    file_id = foto[-1]['file_id']
+    p = foto[-1]  # maior resolução
+    file_id = p['file_id']
+    fname, operador_nome = operador_do_from(msg.get('from'))
+    base_log = {
+        'tg_msg_id': msg_id, 'chat_id': CHAT_ID, 'operador': operador_nome, 'from_nome': fname,
+        'msg_date': iso_epoch(msg.get('date')), 'caption': texto, 'file_id': file_id,
+        'file_unique_id': p.get('file_unique_id'), 'foto_w': p.get('width'), 'foto_h': p.get('height'),
+        'foto_bytes': p.get('file_size'),
+    }
 
     print(f"\n📸 Processando msg #{msg_id}: '{texto[:80]}'")
     log_estrutura(msg)
+    print(f"  👤 from='{fname}' → operador='{operador_nome}'")
+
+    # Mesmo operador, mesma imagem e legenda há poucos minutos, e o primeiro já virou aposta → não duplica
+    dup = print_repetido(operador_nome, texto, p)
+    if dup:
+        print(f"  🔁 Repetido do #{dup} — não registrado")
+        tg_react(msg_id, '🤔')
+        rid = tg_reply(msg_id, f"🔁 #{msg_id} · parece repetido do #{dup} (mesma imagem e legenda, enviado há pouco) — não registrei de novo.\n\n↩️ Se era outra aposta, responda esta mensagem com: corrigir: registrar")
+        log_print({**base_log, 'resultado': 'duplicado', 'n_apostas': 0,
+                   'avisos': [f"repetido do #{dup}"], 'resposta_msg_id': rid})
+        return
+
     extras = textos_extras(msg)
     texto_modelo = texto + (f"\n\nTEXTO ORIGINAL DO TIPSTER (mensagem citada/encaminhada): {extras}" if extras else '')
 
@@ -1105,68 +1388,32 @@ def processar_mensagem(msg, cadastros):
         img_bytes = tg_get_file_bytes(file_id)
         if not img_bytes:
             tg_react(msg_id, '💩')
+            rid = tg_reply(msg_id, f"💩 #{msg_id} · não consegui baixar a imagem do Telegram. Manda o print de novo.")
+            log_print({**base_log, 'resultado': 'erro', 'avisos': ['falha ao baixar a imagem'], 'resposta_msg_id': rid})
             return
 
         data_hoje = datetime.now(BRT).strftime('%Y-%m-%d')
-        # Nome de quem enviou o print (operador) — mapeia pela INICIAL do first_name
-        # S = Samuel, A = Amaral, D = Diego
-        from_user = msg.get('from') or {}
-        fname = (from_user.get('first_name') or from_user.get('username') or '').strip()
-        inicial = fname[:1].upper() if fname else ''
-        mapa_operador = {'S': 'Samuel', 'A': 'Amaral', 'D': 'Diego'}
-        operador_nome = mapa_operador.get(inicial, fname)
-        print(f"  👤 from='{fname}' → inicial='{inicial}' → operador='{operador_nome}'")
         resultado = extrair_aposta(img_bytes, texto_modelo, cadastros, data_hoje, operador_nome)
+        rel = registrar_apostas(resultado, msg_id, cadastros, data_hoje, texto, texto)
 
-        apostas = resultado.get('apostas', [])
-        if not apostas:
-            print("  ⚠️ Nenhuma aposta detectada")
-            tg_react(msg_id, '🤔')
-            return
-
-        # Registra cada aposta no Supabase
-        sucesso = 0
-        avisos_total = []
-        for ap in apostas:
-            try:
-                ap['data_evento'] = ap.get('data_evento') or data_hoje
-                if (ap.get('status') or '').upper() not in STATUS_VALIDOS:
-                    ap['data_evento'] = normalizar_data_evento(ap['data_evento'], data_hoje, texto)
-                if not ap.get('bookie'):
-                    ap['bookie'] = bookie_da_descricao(texto, cadastros)
-                    if ap['bookie']:
-                        print(f"  🏦 Bookie pela descrição: {ap['bookie']}", flush=True)
-                linha = montar_linha(ap, cadastros, tg_msg_id=msg_id)
-                if not linha.get('data_evento'):
-                    linha['data_evento'] = data_hoje
-                avisos = validar_linha(ap, linha)
-                if avisos:
-                    for a in avisos:
-                        print(f"  ⚠️ Aviso: {a}")
-                    avisos_total.extend(avisos)
-                sb_insert('apostas', linha)
-                sucesso += 1
-            except Exception as e:
-                print(f"  ❌ Erro salvando aposta: {e}")
-                traceback.print_exc()
-
-        if sucesso == len(apostas) and not avisos_total:
-            print(f"  ✅ {sucesso} aposta(s) registrada(s)")
-            tg_react(msg_id, '🔥')
-        elif sucesso == len(apostas):
-            print(f"  ⚠️ {sucesso} registrada(s) com {len(avisos_total)} aviso(s) — conferir")
-            tg_react(msg_id, '🤨')
-        elif sucesso > 0:
-            print(f"  ⚠️ {sucesso}/{len(apostas)} apostas registradas")
-            tg_react(msg_id, '🤨')
-        else:
-            print(f"  ❌ Nenhuma aposta salva")
-            tg_react(msg_id, '💩')
+        res = reagir_pelo_relatorio(msg_id, rel)
+        n = len(rel['itens'])
+        print({'ok': f"  ✅ {n} aposta(s) registrada(s)",
+               'aviso': f"  ⚠️ {n} registrada(s), {len(rel['falhas'])} falha(s) — conferir",
+               'sem_aposta': "  ⚠️ Nenhuma aposta detectada",
+               'erro': "  ❌ Nenhuma aposta salva"}[res])
+        rid = tg_reply(msg_id, texto_resposta(msg_id, rel))
+        if rid:
+            print(f"  💬 Respondido no Telegram (#{rid})")
+        log_print({**base_log, 'resultado': res, 'n_apostas': n,
+                   'avisos': avisos_do_relatorio(rel), 'resposta_msg_id': rid})
 
     except Exception as e:
         print(f"  ❌ Exception: {e}")
         traceback.print_exc()
         tg_react(msg_id, '💩')
+        rid = tg_reply(msg_id, f"💩 #{msg_id} · deu erro ao processar ({_erro_curto(e)}). Manda o print de novo ou registra no dash.")
+        log_print({**base_log, 'resultado': 'erro', 'avisos': [f"erro: {_erro_curto(e)}"], 'resposta_msg_id': rid})
 
 # ============================================================
 # LOOP DE POLLING
