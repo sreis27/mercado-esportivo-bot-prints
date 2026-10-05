@@ -89,12 +89,13 @@ def carregar_cadastros():
     return {
         'tipsters': sb_get('tipsters?select=id,nome&ativo=eq.true'),
         'bookies': sb_get('bookies?select=id,nome,moeda&ativo=eq.true'),
-        'operadores': sb_get('operadores?select=id,nome'),
+        'operadores': sb_get('operadores?select=id,nome,tg_user_id'),
         'esportes': sb_get('esportes?select=id,nome&ativo=eq.true'),
         'mercados': sb_get('mercados?select=id,nome'),
         'tipos_aposta': sb_get('tipos_aposta?select=id,nome'),
         'stakes': sb_get('stakes_historico?select=tipster_id,valor_reais,vigente_a_partir'),
         'stakes_usd': sb_get('stakes_usd?select=tipster_id,valor_usd,vigente_a_partir'),
+        'remuneracao': sb_get('remuneracao_operadores?select=operador_id,valor_hora,comissao_pct,vigente_a_partir'),
     }
 
 def extrair_aposta(imagem_bytes, descricao_msg, cadastros, data_hoje, operador_msg=None):
@@ -1027,9 +1028,9 @@ def tg_reply(reply_to_id, texto):
     Devolve o message_id da resposta (ou None)."""
     if not texto:
         return None
-    params = dict(chat_id=CHAT_ID, text=texto[:4000],
-                  reply_parameters={'message_id': reply_to_id, 'allow_sending_without_reply': True},
-                  link_preview_options={'is_disabled': True})
+    params = dict(chat_id=CHAT_ID, text=texto[:4000], link_preview_options={'is_disabled': True})
+    if reply_to_id:
+        params['reply_parameters'] = {'message_id': reply_to_id, 'allow_sending_without_reply': True}
     for tentativa in range(2):
         try:
             r = tg_call('sendMessage', **params)
@@ -1339,6 +1340,11 @@ def processar_mensagem(msg, cadastros):
     texto = msg.get('caption') or msg.get('text') or ''
 
     if not foto:
+        # Registro de horas: "entrada", "saida", "horas" (com ou sem barra)
+        cmd = comando_horas(texto)
+        if cmd:
+            processar_horas(msg, cmd, cadastros)
+            return
         # Correção: texto começando com "corrigir" respondendo o PRINT ou a MENSAGEM DO BOT sobre ele
         reply = msg.get('reply_to_message')
         if not (reply and texto and texto.strip().lower().startswith(GATILHOS_CORRECAO)):
@@ -1407,6 +1413,7 @@ def processar_mensagem(msg, cadastros):
             print(f"  💬 Respondido no Telegram (#{rid})")
         log_print({**base_log, 'resultado': res, 'n_apostas': n,
                    'avisos': avisos_do_relatorio(rel), 'resposta_msg_id': rid})
+        aviso_sem_entrada(msg_id, operador_nome, cadastros)
 
     except Exception as e:
         print(f"  ❌ Exception: {e}")
@@ -1414,6 +1421,252 @@ def processar_mensagem(msg, cadastros):
         tg_react(msg_id, '💩')
         rid = tg_reply(msg_id, f"💩 #{msg_id} · deu erro ao processar ({_erro_curto(e)}). Manda o print de novo ou registra no dash.")
         log_print({**base_log, 'resultado': 'erro', 'avisos': [f"erro: {_erro_curto(e)}"], 'resposta_msg_id': rid})
+
+# ============================================================
+# REGISTRO DE HORAS — "entrada", "saida" e "horas" no Planilhar.
+# Horas registradas × valor da hora = base da nota de cada operador.
+# ============================================================
+def sb_patch(table, where, body):
+    r = requests.patch(f"{SUPABASE_URL}/rest/v1/{table}?{where}", headers=sb_headers(), json=body, timeout=30)
+    if not r.ok:
+        print(f"sb_patch erro: {r.status_code} {r.text}")
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+def sb_rpc(fn, params):
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/{fn}", headers=sb_headers(), json=params, timeout=30)
+    if not r.ok:
+        print(f"sb_rpc erro: {r.status_code} {r.text}")
+    r.raise_for_status()
+    return r.json()
+
+def comando_horas(texto):
+    t = re.sub(r'@\w+$', '', (texto or '').strip().lower()).strip().lstrip('/').strip()
+    return {'entrada': 'entrada', 'saida': 'saida', 'saída': 'saida', 'horas': 'horas'}.get(t)
+
+def _ts(s):
+    return datetime.fromisoformat(s.replace('Z', '+00:00')) if isinstance(s, str) else s
+
+def _utc_q(dt):
+    """Timestamp pro filtro do PostgREST (sem '+', que quebraria a URL)."""
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+def fmt_hm(dt):
+    return dt.astimezone(BRT).strftime('%H:%M')
+
+def fmt_dur(horas):
+    m = int(round(float(horas or 0) * 60))
+    return f"{m // 60}h{m % 60:02d}"
+
+def fmt_brl(v):
+    s = f"{float(v or 0):,.2f}"
+    return 'R$ ' + s.replace(',', 'X').replace('.', ',').replace('X', '.')
+
+def semana_de(data_iso):
+    d = datetime.strptime(data_iso, '%Y-%m-%d')
+    seg = d - timedelta(days=d.weekday())
+    return seg.strftime('%Y-%m-%d'), (seg + timedelta(days=6)).strftime('%Y-%m-%d')
+
+def mes_de(data_iso):
+    d = datetime.strptime(data_iso, '%Y-%m-%d')
+    prox = (d.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return d.replace(day=1).strftime('%Y-%m-%d'), (prox - timedelta(days=1)).strftime('%Y-%m-%d')
+
+def operador_da_msg(msg, cadastros):
+    """Operador pela inicial do nome no Telegram (mesma regra dos prints); guarda o id do Telegram."""
+    _, nome = operador_do_from(msg.get('from'))
+    op = next((o for o in cadastros['operadores'] if o['nome'] == nome), None)
+    uid = (msg.get('from') or {}).get('id')
+    if op and uid and op.get('tg_user_id') != uid:
+        try:
+            sb_patch('operadores', f"id=eq.{op['id']}", {'tg_user_id': uid})
+            op['tg_user_id'] = uid
+        except Exception as e:
+            print(f"  ⚠️ tg_user_id: {e}", flush=True)
+    return op
+
+def remunerado_por_hora(op_id, cadastros, data_iso=None):
+    data_iso = data_iso or datetime.now(BRT).strftime('%Y-%m-%d')
+    cand = sorted([r for r in cadastros.get('remuneracao', [])
+                   if r['operador_id'] == op_id and r['vigente_a_partir'] <= data_iso],
+                  key=lambda r: r['vigente_a_partir'], reverse=True)
+    return bool(cand) and float(cand[0].get('valor_hora') or 0) > 0
+
+def registro_aberto(op_id):
+    rows = sb_get(f"registro_horas?operador_id=eq.{op_id}&fim=is.null&select=id,inicio,tg_msg_inicio&limit=1")
+    return rows[0] if rows else None
+
+def escala_do_dia(op_id, data_iso):
+    rows = sb_get(f"escala?operador_id=eq.{op_id}&data=eq.{data_iso}&select=janela_inicio,janela_fim,horas_previstas&limit=1")
+    return rows[0] if rows else None
+
+def painel_do_operador(nome, de, ate):
+    try:
+        d = sb_rpc('painel_operadores', {'p_de': de, 'p_ate': ate})
+    except Exception as e:
+        print(f"  ⚠️ painel_operadores: {e}", flush=True)
+        return None
+    return next((o for o in (d or {}).get('operadores', []) if o.get('nome') == nome), None)
+
+def linhas_pendencias(p):
+    out = []
+    if p and p.get('pend_prints'):
+        n = p['pend_prints']
+        ids = ', '.join(f"#{i}" for i in (p.get('pend_prints_ids') or [])[:5]) + ('…' if n > 5 else '')
+        out.append(f"• {n} print{'s' if n != 1 else ''} com aviso sem correção ({ids})")
+    if p and p.get('penduradas'):
+        n = p['penduradas']
+        out.append(f"• {n} aposta{'s' if n != 1 else ''} com evento já encerrado pra resolver no dash")
+    return out
+
+def processar_horas(msg, cmd, cadastros):
+    msg_id = msg['message_id']
+    op = operador_da_msg(msg, cadastros)
+    if not op:
+        tg_reply(msg_id, "⏱️ Não achei você no cadastro de operadores.")
+        return
+    nome = op['nome']
+    quando = datetime.fromtimestamp(msg.get('date') or time.time(), timezone.utc)
+    hoje = quando.astimezone(BRT).strftime('%Y-%m-%d')
+    print(f"\n⏱️ {cmd} · {nome} · {fmt_hm(quando)}", flush=True)
+    try:
+        aberto = registro_aberto(op['id'])
+        if cmd == 'entrada':
+            if aberto:
+                ini = _ts(aberto['inicio'])
+                tg_reply(msg_id, f"⏱️ {nome} · você já está com entrada aberta desde {fmt_hm(ini)} "
+                                 f"({fmt_dur((quando - ini).total_seconds() / 3600)}).")
+                return
+            sb_insert('registro_horas', {'operador_id': op['id'], 'inicio': quando.isoformat(),
+                                         'origem': 'telegram', 'tg_msg_inicio': msg_id})
+            linhas = [f"⏱️ {nome} · entrada {fmt_hm(quando)}."]
+            esc = escala_do_dia(op['id'], hoje)
+            if esc:
+                linhas.append(f"Escala de hoje: {esc['janela_inicio'][:5]}–{esc['janela_fim'][:5]}, "
+                              f"{fmt_dur(esc['horas_previstas'])} previstas.")
+            elif remunerado_por_hora(op['id'], cadastros, hoje):
+                linhas.append("Hoje você não está na escala.")
+            linhas.append("Antes de começar, confere os saldos das casas principais.")
+            pend = linhas_pendencias(painel_do_operador(nome, hoje, hoje))
+            if pend:
+                linhas += ["", "Pendente de antes:"] + pend
+            tg_reply(msg_id, '\n'.join(linhas))
+
+        elif cmd == 'saida':
+            if not aberto:
+                tg_reply(msg_id, f"⏱️ {nome} · não achei entrada aberta. Se esqueceu de marcar, "
+                                 f"avisa o Samuel que ele ajusta no painel.")
+                return
+            ini = _ts(aberto['inicio'])
+            fim = max(quando, ini)
+            sb_patch('registro_horas', f"id=eq.{aberto['id']}", {'fim': fim.isoformat(), 'tg_msg_fim': msg_id})
+            seg, dom = semana_de(hoje)
+            p = painel_do_operador(nome, seg, dom)
+            linhas = [f"⏱️ {nome} · saída {fmt_hm(fim)} · {fmt_dur((fim - ini).total_seconds() / 3600)} desta vez."]
+            if p:
+                linhas.append(f"Semana: {fmt_dur(p['horas'])} de {fmt_dur(p['horas_previstas'])} previstas.")
+            pend = linhas_pendencias(p)
+            if pend:
+                linhas += ["", "Ficou pendente:"] + pend
+            tg_reply(msg_id, '\n'.join(linhas))
+
+        else:  # horas
+            seg, dom = semana_de(hoje)
+            m_ini, m_fim = mes_de(hoje)
+            p_sem = painel_do_operador(nome, seg, dom)
+            p_mes = painel_do_operador(nome, m_ini, m_fim)
+            linhas = [f"⏱️ {nome}"]
+            if aberto:
+                linhas.append(f"Entrada aberta desde {fmt_hm(_ts(aberto['inicio']))}.")
+            if p_sem:
+                linhas.append(f"Semana ({seg[8:10]}/{seg[5:7]}–{dom[8:10]}/{dom[5:7]}): {fmt_dur(p_sem['horas'])} "
+                              f"de {fmt_dur(p_sem['horas_previstas'])} previstas · {fmt_brl(p_sem['custo_horas'])}")
+            if p_mes:
+                linhas.append(f"Mês: {fmt_dur(p_mes['horas'])} · {fmt_brl(p_mes['custo_horas'])}")
+            if len(linhas) == 1:
+                linhas.append("Nada registrado ainda.")
+            tg_reply(msg_id, '\n'.join(linhas))
+    except Exception as e:
+        print(f"  ❌ Registro de horas: {e}", flush=True)
+        traceback.print_exc()
+        tg_reply(msg_id, f"⏱️ Deu erro no registro ({_erro_curto(e)}). Tenta de novo.")
+
+_avisou_sem_entrada = {}
+
+def aviso_sem_entrada(msg_id, nome, cadastros):
+    """Print de operador pago por hora sem entrada aberta → lembra de marcar (no máx 1x por dia)."""
+    try:
+        op = next((o for o in cadastros['operadores'] if o['nome'] == nome), None)
+        hoje = datetime.now(BRT).strftime('%Y-%m-%d')
+        if not op or _avisou_sem_entrada.get(nome) == hoje or not remunerado_por_hora(op['id'], cadastros, hoje):
+            return
+        if registro_aberto(op['id']):
+            return
+        _avisou_sem_entrada[nome] = hoje
+        tg_reply(msg_id, f"⏱️ {nome}, você está sem entrada marcada. Manda \"entrada\" aqui pra suas horas contarem.")
+    except Exception as e:
+        print(f"  ⚠️ aviso_sem_entrada: {e}", flush=True)
+
+def ultima_atividade(op, desde):
+    """Último sinal de trabalho do operador desde a entrada: print, edição de aposta/conta ou aposta criada."""
+    q = _utc_q(desde)
+    nome = requests.utils.quote(op['nome'])
+    fontes = [
+        (f"prints_log?operador=eq.{nome}&recebido_em=gte.{q}&order=recebido_em.desc&limit=1&select=t:recebido_em"),
+        (f"historico_apostas?alterado_por=eq.{nome}&alterado_em=gte.{q}&order=alterado_em.desc&limit=1&select=t:alterado_em"),
+        (f"historico_contas?alterado_por=eq.{nome}&alterado_em=gte.{q}&order=alterado_em.desc&limit=1&select=t:alterado_em"),
+        (f"apostas?operador_id=eq.{op['id']}&criado_em=gte.{q}&order=criado_em.desc&limit=1&select=t:criado_em"),
+    ]
+    tempos = []
+    for f in fontes:
+        try:
+            rows = sb_get(f)
+            if rows and rows[0].get('t'):
+                tempos.append(_ts(rows[0]['t']))
+        except Exception as e:
+            print(f"  ⚠️ ultima_atividade: {e}", flush=True)
+    return max(tempos) if tempos else None
+
+def fechar_esquecidos(cadastros):
+    """Entrada aberta depois do fim da janela da escala (+1h) ou 6h sem escala, e sem atividade há 1h:
+    fecha na última atividade, marca como automático e avisa. O Samuel revisa no painel."""
+    if not cadastros:
+        return
+    try:
+        abertos = sb_get("registro_horas?fim=is.null&select=id,operador_id,inicio,tg_msg_inicio")
+    except Exception as e:
+        print(f"  ⚠️ fechar_esquecidos: {e}", flush=True)
+        return
+    agora = datetime.now(timezone.utc)
+    for r in abertos:
+        try:
+            op = next((o for o in cadastros['operadores'] if o['id'] == r['operador_id']), None)
+            if not op:
+                continue
+            ini = _ts(r['inicio'])
+            dia = ini.astimezone(BRT).strftime('%Y-%m-%d')
+            esc = escala_do_dia(op['id'], dia)
+            if esc:
+                fim_janela = datetime.strptime(f"{dia} {esc['janela_fim'][:5]}", '%Y-%m-%d %H:%M').replace(tzinfo=BRT)
+                limite = max(fim_janela, ini) + timedelta(hours=1)
+            else:
+                limite = ini + timedelta(hours=6)
+            if agora < limite:
+                continue
+            ult = ultima_atividade(op, ini)
+            if ult and agora - ult < timedelta(hours=1):
+                continue  # ainda trabalhando
+            fim = max(ult or ini, ini)
+            sb_patch('registro_horas', f"id=eq.{r['id']}&fim=is.null",
+                     {'fim': fim.isoformat(), 'fim_auto': True,
+                      'obs': 'fechado automaticamente na última atividade'})
+            horas = (fim - ini).total_seconds() / 3600
+            print(f"  ⏱️ Entrada esquecida de {op['nome']} fechada às {fmt_hm(fim)} ({fmt_dur(horas)})", flush=True)
+            tg_reply(r.get('tg_msg_inicio'),
+                     f"⏱️ {op['nome']} · sua entrada das {fmt_hm(ini)} ficou aberta. Fechei às {fmt_hm(fim)}, "
+                     f"na sua última atividade ({fmt_dur(horas)}). Se não for isso, o Samuel ajusta no painel.")
+        except Exception as e:
+            print(f"  ⚠️ fechar_esquecidos ({r.get('id')}): {e}", flush=True)
 
 # ============================================================
 # LOOP DE POLLING
@@ -1434,6 +1687,7 @@ def main():
 
     # Recarrega cadastros a cada 5 min pra captar novos
     ultimo_refresh = 0
+    ultimo_check_horas = 0
     cadastros = None
 
     while True:
@@ -1445,6 +1699,11 @@ def main():
                 cadastros = carregar_cadastros()
                 ultimo_refresh = agora
                 print(f"  {len(cadastros['tipsters'])} tipsters, {len(cadastros['bookies'])} bookies, {len(cadastros['operadores'])} operadores")
+
+            # Entradas esquecidas abertas → fecha na última atividade
+            if agora - ultimo_check_horas > 300:
+                ultimo_check_horas = agora
+                fechar_esquecidos(cadastros)
 
             # Long polling
             r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
