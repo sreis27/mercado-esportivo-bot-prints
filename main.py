@@ -16,6 +16,9 @@ SUPABASE_URL    = "https://yfdrifvhsiumdxgypkjm.supabase.co"
 SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "")
 TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID         = int(os.environ.get("TELEGRAM_CHAT_ID", "-4711785999"))
+# RM Office - Chat (grupo da equipe): aviso de início/fim de turno. Usa o bot do monitor, que já está no grupo.
+TOKEN_CHAT_EQUIPE = os.environ.get("TELEGRAM_TOKEN_CHAT", "") or TELEGRAM_TOKEN
+CHAT_EQUIPE       = int(os.environ.get("TELEGRAM_CHAT_ID_CHAT", "-4659428992"))
 ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_KEY", "")
 
 BRT = timezone(timedelta(hours=-3))
@@ -1603,7 +1606,8 @@ def aviso_sem_entrada(msg_id, nome, cadastros):
         if registro_aberto(op['id']):
             return
         _avisou_sem_entrada[nome] = hoje
-        tg_reply(msg_id, f"⏱️ {nome}, você está sem entrada marcada. Manda \"entrada\" aqui pra suas horas contarem.")
+        tg_reply(msg_id, f"⏱️ {nome}, você está sem entrada marcada. Aperta \"Iniciar turno\" no dash das contas "
+                         f"ou manda \"entrada\" aqui pra suas horas contarem.")
     except Exception as e:
         print(f"  ⚠️ aviso_sem_entrada: {e}", flush=True)
 
@@ -1668,6 +1672,91 @@ def fechar_esquecidos(cadastros):
         except Exception as e:
             print(f"  ⚠️ fechar_esquecidos ({r.get('id')}): {e}", flush=True)
 
+def tg_equipe(texto, reply_to=None):
+    """Mensagem no RM Office - Chat. Devolve o message_id (ou None se não foi)."""
+    params = {'chat_id': CHAT_EQUIPE, 'text': texto[:4000], 'link_preview_options': {'is_disabled': True}}
+    if reply_to:
+        params['reply_parameters'] = {'message_id': reply_to, 'allow_sending_without_reply': True}
+    for tentativa in range(2):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TOKEN_CHAT_EQUIPE}/sendMessage", json=params, timeout=20).json()
+        except Exception as e:
+            print(f"  ⚠️ RM Office - Chat: {e}", flush=True)
+            return None
+        if r.get('ok'):
+            return r['result']['message_id']
+        espera = (r.get('parameters') or {}).get('retry_after')
+        if r.get('error_code') == 429 and espera and tentativa == 0:
+            time.sleep(min(int(espera), 10))
+            continue
+        print(f"  ⚠️ RM Office - Chat: {r.get('description')}", flush=True)
+        return None
+    return None
+
+def anunciar_turnos(cadastros):
+    """Início e fim de turno (botão do dash ou "entrada"/"saida" no Planilhar) → aviso no RM Office - Chat.
+    Olha só os últimos 10 min (não anuncia coisa velha depois de um deploy). Fora: lançamento à mão,
+    registro ajustado pelo Samuel e saída fechada pelo bot (essa vai só no Planilhar)."""
+    if not cadastros:
+        return
+    desde = _utc_q(datetime.now(timezone.utc) - timedelta(minutes=10))
+    base = "registro_horas?origem=in.(dash,telegram)&ajustado_por=is.null&select=id,operador_id,inicio,fim,aviso_inicio_msg"
+    nome_de = lambda op_id: next((o['nome'] for o in cadastros['operadores'] if o['id'] == op_id), None)
+
+    try:
+        inicios = sb_get(f"{base}&aviso_inicio_msg=is.null&inicio=gte.{desde}&order=inicio")
+    except Exception as e:
+        print(f"  ⚠️ anunciar_turnos: {e}", flush=True)
+        return
+    for r in inicios:
+        nome = nome_de(r['operador_id'])
+        if not nome:
+            continue
+        ini = _ts(r['inicio'])
+        linhas = [f"⏱️ {nome} iniciou o turno às {fmt_hm(ini)}."]
+        try:
+            esc = escala_do_dia(r['operador_id'], ini.astimezone(BRT).strftime('%Y-%m-%d'))
+        except Exception as e:
+            esc = None
+            print(f"  ⚠️ anunciar_turnos (escala): {e}", flush=True)
+        if esc:
+            linhas.append(f"Escala de hoje: {esc['janela_inicio'][:5]}–{esc['janela_fim'][:5]} · {fmt_dur(esc['horas_previstas'])}")
+        elif remunerado_por_hora(r['operador_id'], cadastros, ini.astimezone(BRT).strftime('%Y-%m-%d')):
+            linhas.append("Hoje não está na escala.")
+        mid = tg_equipe('\n'.join(linhas))
+        if mid:
+            r['aviso_inicio_msg'] = mid
+            try:
+                sb_patch('registro_horas', f"id=eq.{r['id']}", {'aviso_inicio_msg': mid})
+            except Exception as e:
+                print(f"  ⚠️ anunciar_turnos (patch início): {e}", flush=True)
+            print(f"  ⏱️ RM Office - Chat: {nome} iniciou o turno ({fmt_hm(ini)})", flush=True)
+
+    try:
+        fins = sb_get(f"{base}&aviso_fim_msg=is.null&fim_auto=is.false&fim=gte.{desde}&order=fim")
+    except Exception as e:
+        print(f"  ⚠️ anunciar_turnos: {e}", flush=True)
+        return
+    for r in fins:
+        nome = nome_de(r['operador_id'])
+        if not nome:
+            continue
+        ini, fim = _ts(r['inicio']), _ts(r['fim'])
+        linhas = [f"⏱️ {nome} encerrou o turno às {fmt_hm(fim)} · {fmt_dur((fim - ini).total_seconds() / 3600)}."]
+        seg, dom = semana_de(fim.astimezone(BRT).strftime('%Y-%m-%d'))
+        p = painel_do_operador(nome, seg, dom)
+        if p and float(p.get('horas_previstas') or 0) > 0:
+            linhas.append(f"Semana: {fmt_dur(p['horas'])} de {fmt_dur(p['horas_previstas'])} previstas.")
+        elif p:
+            linhas.append(f"Semana: {fmt_dur(p['horas'])}.")
+        mid = tg_equipe('\n'.join(linhas), reply_to=r.get('aviso_inicio_msg') or None)
+        if mid:
+            try:
+                sb_patch('registro_horas', f"id=eq.{r['id']}", {'aviso_fim_msg': mid})
+            except Exception as e:
+                print(f"  ⚠️ anunciar_turnos (patch fim): {e}", flush=True)
+            print(f"  ⏱️ RM Office - Chat: {nome} encerrou o turno ({fmt_hm(fim)})", flush=True)
+
 # ============================================================
 # LOOP DE POLLING
 # ============================================================
@@ -1688,6 +1777,7 @@ def main():
     # Recarrega cadastros a cada 5 min pra captar novos
     ultimo_refresh = 0
     ultimo_check_horas = 0
+    ultimo_turnos = 0
     cadastros = None
 
     while True:
@@ -1705,9 +1795,14 @@ def main():
                 ultimo_check_horas = agora
                 fechar_esquecidos(cadastros)
 
-            # Long polling
+            # Início/fim de turno → RM Office - Chat
+            if agora - ultimo_turnos >= 8:
+                ultimo_turnos = agora
+                anunciar_turnos(cadastros)
+
+            # Long polling (10s: o aviso de turno do dash não espera mais que isso)
             r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                             params={'offset': offset, 'timeout': 30}, timeout=60)
+                             params={'offset': offset, 'timeout': 10}, timeout=40)
             if not r.ok:
                 time.sleep(5)
                 continue
