@@ -115,12 +115,16 @@ def extrair_aposta(imagem_bytes, descricao_msg, cadastros, data_hoje, operador_m
     esportes_lista = sorted(e['nome'] for e in cadastros['esportes'])
     mercados_lista = sorted(m['nome'] for m in cadastros.get('mercados', []))
     tipos_aposta_lista = sorted(t['nome'] for t in cadastros.get('tipos_aposta', []))
+    casas_usd = sorted(b['nome'] for b in cadastros['bookies'] if b.get('moeda') == 'USD')
+    casas_ambas = sorted(b['nome'] for b in cadastros['bookies'] if b.get('moeda') == 'AMBAS')
 
     # Bloco de CADASTROS — muda raramente (cadastro novo). Vai no system com cache 1h:
     # sai do preço cheio ($3/M) e entra como cache read ($0,30/M) em ~toda chamada.
     contexto_cadastros = f"""CADASTROS EXISTENTES — use o nome EXATAMENTE como aparece aqui:
 - Tipsters: {json.dumps(tipsters_lista, ensure_ascii=False)}
 - Bookies: {json.dumps(bookies_lista, ensure_ascii=False)}
+- Casas só em dólar: {json.dumps(casas_usd, ensure_ascii=False)}
+- Casas que aceitam R$ e US$ (a moeda é a do valor apostado no print/legenda): {json.dumps(casas_ambas, ensure_ascii=False)}
 - Operadores: {json.dumps(operadores_lista, ensure_ascii=False)}
 - Esportes: {json.dumps(esportes_lista, ensure_ascii=False)}
 - Mercados: {json.dumps(mercados_lista, ensure_ascii=False)}
@@ -612,9 +616,10 @@ L. EXTRAÇÃO DE EVENTO E MERCADO DIRETO DO PRINT: quando o print mostra clarame
      * Se NENHUM mercado da lista corresponder semanticamente, extraia o texto como aparece no print.
      * JAMAIS retornar "ML" literal ou null quando há rótulo explícito da casa no print — sempre tente match semântico primeiro.
 
-U. CASAS EM DÓLAR (ThunderPick, Polymarket e similares):
+U. CASAS EM DÓLAR (ThunderPick, Polymarket e similares) E CASAS COM R$ E US$ (listas em CADASTROS):
    - Marca d'água ou logo da casa no print IDENTIFICA o bookie mesmo sem a descrição citar (ex: marca d'água "THUNDERPICK" → bookie "ThunderPick").
-   - Valor apostado em USD / US$ / $ (ex: "Aposta 50,01 USD") → preencha stake_usd: 50.01 e deixe stake_reais null. NUNCA coloque valor em dólar em stake_reais.
+   - Valor apostado em USD / US$ / $ / USDT (ex: "Aposta 50,01 USD", legenda "20 usd") → preencha stake_usd: 50.01 e deixe stake_reais null. NUNCA coloque valor em dólar em stake_reais.
+   - Casa que aceita R$ e US$ (ex.: Stake): a moeda é a do VALOR, nunca a da casa. "R$" no print ou valor na legenda sem moeda ("150,00") → stake_reais; "$", "US$", "USD" ou "USDT" no print ou na legenda → stake_usd. Se legenda e print divergirem, vale a legenda.
    - Se além do valor em dólar houver stake em unidades explícita ("1u"), preencha também stake_unidades.
 
 V. APOSTA JÁ RESOLVIDA NO PRINT:
@@ -666,7 +671,7 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
 8. ODD: descrição tem "odd X.XX" (ou typos "od"/"ood")? → USEI esse valor, NÃO o do print.
 9. "BH" no cabeçalho? → tipster "BH CS" + esporte "Counter-Strike".
 10. Tipo_aposta: 1 seleção sem marcador especial = Simples. Não inventar Criar Aposta.
-11. Valor em USD/US$/$ no bilhete ou marca d'água de casa em dólar? → stake_usd preenchido, stake_reais null, bookie pela marca d'água.
+11. Valor em USD/US$/$/USDT no bilhete ou na legenda, ou marca d'água de casa só em dólar? → stake_usd preenchido, stake_reais null, bookie pela marca d'água. Casa com R$ e US$: moeda pelo valor (R$ ou sem moeda → stake_reais).
 12. Selo de resultado (Ganho/Perdido/Reembolso...)? → status preenchido. Sem selo → null.
 13. Algum campo pode estar errado (leitura ambígua, valor suposto)? → "duvidas" da aposta (máx 2). Nenhuma aposta achada → "duvida_geral" com o motivo.
 """
@@ -1153,7 +1158,8 @@ def montar_linha(ap, cadastros, tg_msg_id=None):
     su_usd = ap.get('stake_usd')
     data_ev = ap.get('data_evento')
 
-    # Moeda: valor em dólar no print OU casa marcada como USD no cadastro
+    # Moeda: valor em dólar no print OU casa só em dólar no cadastro.
+    # Casa que aceita as duas (AMBAS, ex.: Stake): vale o valor lido — sem valor em dólar, fica em R$.
     moeda_casa = next((b.get('moeda') for b in cadastros['bookies'] if b['id'] == bookie_id), 'BRL') if bookie_id else 'BRL'
     moeda = 'USD' if (su_usd or moeda_casa == 'USD') else 'BRL'
 
@@ -1246,6 +1252,9 @@ def registrar_apostas(resultado, tg_msg_id, cadastros, data_hoje, texto_data, te
             linha = montar_linha(ap, cadastros, tg_msg_id=tg_msg_id)
             if not linha.get('data_evento'):
                 linha['data_evento'] = data_hoje
+            casa = next((b for b in cadastros['bookies'] if b['id'] == linha.get('bookie_id')), None)
+            if casa and casa.get('moeda') == 'AMBAS' and ap.get('stake_usd') is None and ap.get('stake_reais') is None:
+                duvidas.append(f"moeda: {casa['nome']} aceita R$ e US$ e não vi valor no print — registrei em R$")
             avisos = validar_linha(ap, linha)
             for a in avisos:
                 print(f"  ⚠️ Aviso: {a}")
