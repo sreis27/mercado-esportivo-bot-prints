@@ -991,7 +991,7 @@ def novo_relatorio():
 def texto_resposta(orig_id, rel, correcao=False):
     """Texto da resposta no Telegram, ou None quando não há nada a dizer (print ok)."""
     itens, falhas = rel['itens'], rel['falhas']
-    dica = "↩️ Pra corrigir, responda esta mensagem com: corrigir: <o que mudar>"
+    dica = "↩️ Pra corrigir, responda esta mensagem com: corrigir: <o que mudar> · se estiver certo, responda: ok"
 
     if not itens and not falhas:
         cab = (f"🤔 #{orig_id} · mesmo com a correção não achei aposta nesse print — nada foi alterado."
@@ -1214,6 +1214,43 @@ def montar_linha(ap, cadastros, tg_msg_id=None):
 CORRECAO_DESDE_TS = 1785283200  # 2026-07-28 00:00 UTC
 
 GATILHOS_CORRECAO = ('corrigir', 'correção', 'correcao', 'corrige', 'fix')
+GATILHOS_OK = {'ok', 'okay', 'certo', 'ta certo', 'tá certo', 'correto', 'confere', 'conferido', 'conferi',
+               'isso', 'perfeito', 'beleza', 'blz', '👍', '👌', '✅'}
+
+def eh_conferencia(texto):
+    """Resposta curta de "está certo" ao aviso do bot (a mensagem inteira, não "ok mas corrige a odd")."""
+    t = re.sub(r'[\s!.,]+$', '', (texto or '').strip().lower())
+    return t in GATILHOS_OK or t.startswith('👍')
+
+def processar_conferencia(msg, reply):
+    """'ok' respondendo o aviso do bot (ou o próprio print): o operador conferiu e está certo.
+    Marca o print como conferido — sai das pendências — sem mexer nas apostas."""
+    msg_id = msg['message_id']
+    orig_id = None
+    if reply.get('photo'):
+        orig_id = reply.get('message_id')
+    elif (reply.get('from') or {}).get('is_bot'):
+        m = re.search(r'#(\d+)', reply.get('text') or '')
+        orig_id = int(m.group(1)) if m else None
+    if not orig_id:
+        return
+    try:
+        rows = sb_get(f"prints_log?tg_msg_id=eq.{orig_id}&select=tg_msg_id,resultado,corrigido_em,conferido_em")
+    except Exception as e:
+        print(f"  ⚠️ prints_log (conferência): {e}", flush=True)
+        return
+    if not rows or rows[0].get('resultado') != 'aviso':
+        return
+    quem = operador_do_from(msg.get('from'))[1]
+    if not (rows[0].get('conferido_em') or rows[0].get('corrigido_em')):
+        try:
+            sb_patch('prints_log', f"tg_msg_id=eq.{orig_id}",
+                     {'conferido_em': datetime.now(timezone.utc).isoformat(), 'conferido_por': quem})
+        except Exception as e:
+            print(f"  ⚠️ conferência #{orig_id}: {e}", flush=True)
+            return
+        print(f"\n👌 #{orig_id} conferido por {quem}", flush=True)
+    tg_react(msg_id, '👌')
 
 def operador_do_from(from_user):
     """Nome de quem enviou → operador, pela INICIAL do first_name (S = Samuel, A = Amaral, D = Diego)."""
@@ -1228,8 +1265,9 @@ def _fmt_data_br(s):
 def _erro_curto(e):
     return (str(e).split(' for url')[0].strip() or e.__class__.__name__)[:80]
 
-def registrar_apostas(resultado, tg_msg_id, cadastros, data_hoje, texto_data, texto_bookie):
-    """Grava as apostas extraídas e devolve o relatório: o que entrou (com avisos/dúvidas) e o que falhou."""
+def registrar_apostas(resultado, tg_msg_id, cadastros, data_hoje, texto_data, texto_bookie, criado_por=None):
+    """Grava as apostas extraídas e devolve o relatório: o que entrou (com avisos/dúvidas) e o que falhou.
+    criado_por = quem mandou o print (base da produtividade de cada um)."""
     rel = novo_relatorio()
     apostas = (resultado or {}).get('apostas') or []
     if not apostas:
@@ -1252,6 +1290,8 @@ def registrar_apostas(resultado, tg_msg_id, cadastros, data_hoje, texto_data, te
             linha = montar_linha(ap, cadastros, tg_msg_id=tg_msg_id)
             if not linha.get('data_evento'):
                 linha['data_evento'] = data_hoje
+            if criado_por:
+                linha['criado_por'] = criado_por
             casa = next((b for b in cadastros['bookies'] if b['id'] == linha.get('bookie_id')), None)
             if casa and casa.get('moeda') == 'AMBAS' and ap.get('stake_usd') is None and ap.get('stake_reais') is None:
                 duvidas.append(f"moeda: {casa['nome']} aceita R$ e US$ e não vi valor no print — registrei em R$")
@@ -1322,7 +1362,7 @@ def processar_correcao(msg, reply, cadastros):
         if not resultado.get('apostas'):
             print("  ⚠️ Nenhuma aposta na re-extração — nada substituído")
             tg_react(msg_id, '🤔')
-            rel = registrar_apostas(resultado, orig_id, cadastros, data_hoje, descricao, '')
+            rel = registrar_apostas(resultado, orig_id, cadastros, data_hoje, descricao, '', criado_por=operador_nome)
             tg_reply(msg_id, texto_resposta(orig_id, rel, correcao=True))
             return
 
@@ -1332,7 +1372,7 @@ def processar_correcao(msg, reply, cadastros):
             print(f"  🔄 {len(existentes)} aposta(s) antigas removidas")
 
         rel = registrar_apostas(resultado, orig_id, cadastros, data_hoje, descricao,
-                                descricao.split('CORREÇÃO DO OPERADOR')[-1])
+                                descricao.split('CORREÇÃO DO OPERADOR')[-1], criado_por=operador_nome)
         res = reagir_pelo_relatorio(msg_id, rel)
         print(f"  ✏️ Correção: {len(rel['itens'])} registrada(s), {len(rel['falhas'])} falha(s) → {res}")
         tg_reply(msg_id, texto_resposta(orig_id, rel, correcao=True))
@@ -1357,8 +1397,12 @@ def processar_mensagem(msg, cadastros):
         if cmd:
             processar_horas(msg, cmd, cadastros)
             return
-        # Correção: texto começando com "corrigir" respondendo o PRINT ou a MENSAGEM DO BOT sobre ele
         reply = msg.get('reply_to_message')
+        # Conferência: "ok" respondendo o aviso do bot (ou o print) → marca como conferido
+        if reply and eh_conferencia(texto):
+            processar_conferencia(msg, reply)
+            return
+        # Correção: texto começando com "corrigir" respondendo o PRINT ou a MENSAGEM DO BOT sobre ele
         if not (reply and texto and texto.strip().lower().startswith(GATILHOS_CORRECAO)):
             return  # não é print nem correção, ignora
         if reply.get('photo'):
@@ -1412,7 +1456,7 @@ def processar_mensagem(msg, cadastros):
 
         data_hoje = datetime.now(BRT).strftime('%Y-%m-%d')
         resultado = extrair_aposta(img_bytes, texto_modelo, cadastros, data_hoje, operador_nome)
-        rel = registrar_apostas(resultado, msg_id, cadastros, data_hoje, texto, texto)
+        rel = registrar_apostas(resultado, msg_id, cadastros, data_hoje, texto, texto, criado_por=operador_nome)
 
         res = reagir_pelo_relatorio(msg_id, rel)
         n = len(rel['itens'])
