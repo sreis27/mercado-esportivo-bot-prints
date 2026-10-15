@@ -1,0 +1,1883 @@
+"""
+Bot de Prints — Mercado Esportivo
+Monitora o grupo 'RM Office - Planilhar', extrai dados de prints de apostas
+via Claude Vision e registra automaticamente no Supabase como PENDING.
+"""
+
+import os, json, re, base64, time, traceback
+from datetime import datetime, timezone, timedelta
+import requests
+import anthropic
+
+# ============================================================
+# CREDENCIAIS
+# ============================================================
+SUPABASE_URL    = "https://yfdrifvhsiumdxgypkjm.supabase.co"
+SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "")
+TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID         = int(os.environ.get("TELEGRAM_CHAT_ID", "-4711785999"))
+# RM Office - Chat (grupo da equipe): aviso de início/fim de turno. Usa o bot do monitor, que já está no grupo.
+TOKEN_CHAT_EQUIPE = os.environ.get("TELEGRAM_TOKEN_CHAT", "") or TELEGRAM_TOKEN
+CHAT_EQUIPE       = int(os.environ.get("TELEGRAM_CHAT_ID_CHAT", "-4659428992"))
+ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_KEY", "")
+
+BRT = timezone(timedelta(hours=-3))
+
+# ============================================================
+# HELPERS
+# ============================================================
+def sb_headers():
+    return {
+        'apikey': SUPABASE_KEY,
+        'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation'
+    }
+
+def sb_get(path):
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/{path}", headers=sb_headers(), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def sb_insert(table, body):
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=sb_headers(), json=body, timeout=30
+    )
+    if not r.ok:
+        print(f"sb_insert erro: {r.status_code} {r.text}")
+    r.raise_for_status()
+    return r.json()
+
+def sb_delete(table, where):
+    """DELETE com filtro PostgREST, ex: sb_delete('apostas', 'tg_msg_id=eq.123')"""
+    r = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/{table}?{where}",
+        headers=sb_headers(), timeout=30
+    )
+    if not r.ok:
+        print(f"sb_delete erro: {r.status_code} {r.text}")
+    r.raise_for_status()
+    return True
+
+def tg_call(method, **params):
+    r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
+                      json=params, timeout=30)
+    return r.json()
+
+def tg_get_file_bytes(file_id):
+    """Baixa uma imagem do Telegram como bytes."""
+    info = tg_call('getFile', file_id=file_id)
+    if not info.get('ok'):
+        return None
+    path = info['result']['file_path']
+    r = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}", timeout=60)
+    return r.content if r.ok else None
+
+def tg_react(message_id, emoji):
+    """Adiciona reação à mensagem. emoji: '👀' processando, '🔥' sucesso, '🤨' parcial, '🤔' não entendi, '💩' erro."""
+    try:
+        return tg_call('setMessageReaction',
+                       chat_id=CHAT_ID, message_id=message_id,
+                       reaction=[{'type': 'emoji', 'emoji': emoji}])
+    except Exception as e:
+        print(f"Erro ao reagir: {e}")
+
+# ============================================================
+# EXTRAÇÃO VIA CLAUDE VISION
+# ============================================================
+def carregar_cadastros():
+    """Carrega listas de cadastros do Supabase pra contextualizar o Claude.
+    Tipsters, bookies e esportes inativos são filtrados (nao aparecem como opcoes)."""
+    return {
+        'tipsters': sb_get('tipsters?select=id,nome&ativo=eq.true'),
+        'bookies': sb_get('bookies?select=id,nome,moeda&ativo=eq.true'),
+        'operadores': sb_get('operadores?select=id,nome,tg_user_id'),
+        'esportes': sb_get('esportes?select=id,nome&ativo=eq.true'),
+        'mercados': sb_get('mercados?select=id,nome'),
+        'tipos_aposta': sb_get('tipos_aposta?select=id,nome'),
+        'stakes': sb_get('stakes_historico?select=tipster_id,valor_reais,vigente_a_partir'),
+        'stakes_usd': sb_get('stakes_usd?select=tipster_id,valor_usd,vigente_a_partir'),
+        'remuneracao': sb_get('remuneracao_operadores?select=operador_id,valor_hora,comissao_pct,vigente_a_partir'),
+    }
+
+def extrair_aposta(imagem_bytes, descricao_msg, cadastros, data_hoje, operador_msg=None):
+    """Usa Claude Vision pra extrair dados da imagem + descrição da mensagem."""
+    client = anthropic.Anthropic(
+        api_key=ANTHROPIC_KEY,
+        default_headers={"anthropic-beta": "extended-cache-ttl-2025-04-11"}
+    )
+
+    # sorted(): ordem estável byte a byte — essencial pro cache do bloco de cadastros bater
+    tipsters_lista = sorted(t['nome'] for t in cadastros['tipsters'])
+    bookies_lista = sorted(b['nome'] for b in cadastros['bookies'])
+    operadores_lista = sorted(o['nome'] for o in cadastros['operadores'])
+    esportes_lista = sorted(e['nome'] for e in cadastros['esportes'])
+    mercados_lista = sorted(m['nome'] for m in cadastros.get('mercados', []))
+    tipos_aposta_lista = sorted(t['nome'] for t in cadastros.get('tipos_aposta', []))
+    casas_usd = sorted(b['nome'] for b in cadastros['bookies'] if b.get('moeda') == 'USD')
+    casas_ambas = sorted(b['nome'] for b in cadastros['bookies'] if b.get('moeda') == 'AMBAS')
+
+    # Bloco de CADASTROS — muda raramente (cadastro novo). Vai no system com cache 1h:
+    # sai do preço cheio ($3/M) e entra como cache read ($0,30/M) em ~toda chamada.
+    contexto_cadastros = f"""CADASTROS EXISTENTES — use o nome EXATAMENTE como aparece aqui:
+- Tipsters: {json.dumps(tipsters_lista, ensure_ascii=False)}
+- Bookies: {json.dumps(bookies_lista, ensure_ascii=False)}
+- Casas só em dólar: {json.dumps(casas_usd, ensure_ascii=False)}
+- Casas que aceitam R$ e US$ (a moeda é a do valor apostado no print/legenda): {json.dumps(casas_ambas, ensure_ascii=False)}
+- Operadores: {json.dumps(operadores_lista, ensure_ascii=False)}
+- Esportes: {json.dumps(esportes_lista, ensure_ascii=False)}
+- Mercados: {json.dumps(mercados_lista, ensure_ascii=False)}
+- Tipos de Aposta: {json.dumps(tipos_aposta_lista, ensure_ascii=False)}"""
+
+    # Bloco VARIÁVEL — muda a cada chamada (operador, descrição, data). Fica fora do cache.
+    contexto_variavel = f"""CONTEXTO DESTA CHAMADA:
+
+QUEM ENVIOU (operador): "{operador_msg or '(desconhecido)'}"
+DESCRIÇÃO: "{descricao_msg or '(sem descrição)'}"
+DATA DE HOJE: {data_hoje}"""
+
+    # Bloco FIXO — ~720 linhas de regras que nunca mudam. Vai como system + prompt caching.
+    regras_fixas = """Você é o sistema automatizado de planilhamento do Mercado Esportivo. Opera com julgamento humano.
+
+Analise o PRINT DE APOSTA em anexo combinado com a descrição que o operador adicionou.
+
+═══════════════════════════════════════════════════════════════
+REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
+═══════════════════════════════════════════════════════════════
+
+[R1] DATA: só use uma data se estiver ESCRITA EXPLICITAMENTE no print ou na descrição (rótulos "Data:", "Entrada para:", "Jogo em:", ou formato inequívoco DD/MM/AAAA). NUNCA infira data a partir de nomes de grupo, canal, temporada ou temporada-ano. Formatos como "2026.03 [nome]", "T03", "Season X" são IDENTIFICADORES DE GRUPO, NÃO DATAS. Se não há data explícita, use a DATA DE HOJE informada no contexto como fallback. Proibido inventar datas.
+
+   ATENÇÃO ESPECIAL — CABEÇALHOS COM "AAAA.MM" ou "AAAA-MM" NO NOME DO GRUPO:
+   - Exemplo: cabeçalho "2026.03 Courtside" → "2026.03" é APENAS identificador de temporada/grupo (março de 2026). NÃO é data do evento.
+   - Exemplo: cabeçalho "T03 - BH Tipster" → "T03" é temporada 3.
+   - Exemplo: cabeçalho "2026-Q1 GDA Tradicional" → trimestre fiscal, não data.
+   - NUNCA converta "2026.03" em "20/03/2026", "01/03/2026" ou qualquer data. Use a DATA DE HOJE.
+   - A data do evento SÓ sai de texto explícito dentro do bilhete/descrição (ex: "25 Abr 18:30", "Entrada para 23/04/2026", "LIVE").
+
+[R2] CRIAR APOSTA = 1 ITEM SÓ. Detecte Criar Aposta por DUAS VIAS:
+
+   VIA A — palavra explícita: se o print tem "CRIAR APOSTA", "BET BUILDER", "ACUMULADOR DO JOGO", "MEU BILHETE" ou "JOGO DO SEU JEITO" escrita explicitamente (geralmente em destaque no topo).
+
+   VIA B — SINAIS ESTRUTURAIS (sem palavra explícita, comum no JDF-VIP e outros): o print mostra
+   - Múltiplas seleções (2+) DO MESMO JOGADOR ou DO MESMO JOGO
+   - UMA ÚNICA cotação/odd total (ex: "COTAÇÕES 30.57", "45.81")
+   - UM ÚNICO botão APOSTAR com valor (ex: "APOSTAR R$ 1", "APOSTAR R$ 0,5")
+   - UM ÚNICO valor de "Ganhos potenciais" / "Retornos potenciais"
+   - Ícones de trash (🗑️) em cada linha da seleção
+   - Sem botões/campos de aposta individuais por linha
+   - OPCIONAL: texto "N Seleções" / "N Selections" em destaque no topo (sinal definitivo)
+
+   Quando detectar por qualquer uma das vias, é UMA aposta única com tipo_aposta = "Criar Aposta". JAMAIS quebre em várias apostas. Concatene TODAS as seleções no campo entrada, separadas por vírgula. A odd é única.
+
+   EXEMPLO NEGATIVO (PROIBIDO): ver print com "3 Seleções" em destaque + Paolo Banchero 30+ pontos + Paolo Banchero 10+ rebotes + Paolo Banchero 6+ assistências + odd 45.81 + R$ 1 e registrar 3 itens como Simples. ERRADO. O correto é: 1 item, tipo "Criar Aposta", entrada "Paolo Banchero 30+ Pontos, 10+ Rebotes, 6+ Assistências", odd 45.81.
+
+   MESMO PADRÃO NO JDF-VIP: seleções do mesmo jogador empilhadas + UMA cotação + UM valor APOSTAR = Criar Aposta SEMPRE, independente de a palavra estar escrita ou não.
+
+   INVERSO TAMBÉM PROIBIDO: sem NENHUM dos sinais acima, NÃO classifique como Criar Aposta. Se há 1 seleção só, é Simples.
+
+[R3] BET365 COMO BOOKIE: quando a descrição começa com "365" (ex: "365 deia", "365 will in in"), o bookie é SEMPRE Bet365. Nunca deixe bookie null nesse caso.
+
+[R4] ESPORTE — ESPECÍFICO PREVALECE SOBRE GENÉRICO: se a lista de esportes tem "NBA" cadastrado separadamente de "Basquete", jogos da NBA (Lakers, Spurs, Trail Blazers, Warriors, Celtics, Heat, Nets, Bulls, Knicks, Rockets, Mavericks, Suns, Grizzlies, 76ers, Kings, Clippers, Pelicans, Hawks, Raptors, Wizards, Magic, Hornets, Pacers, Pistons, Thunder, Jazz, Nuggets, Timberwolves, Bucks) → esporte: NBA. Mesma lógica vale pra outras ligas específicas cadastradas (WNBA, Euroliga, NCAA, Futebol Feminino, etc.). Se só tem "Basquete" genérico, use Basquete.
+
+[R5] RÓTULO DA CASA PREVALECE SEMPRE: o texto que a CASA DE APOSTAS pinta explicitamente acima/ao lado da seleção no bilhete é a FONTE PRIMÁRIA do mercado. Nunca ignorar rótulos da casa como:
+   - "Total de pontos" / "Total games" / "Total de rebotes" / "Total de cartões" / "Total chutes" → mapeia pro mercado cadastrado correspondente (Pontos, Games, Rebotes, Cartões, Chutes, etc.)
+   - "Handicap de Games" / "Handicap de Set" / "Handicap de Rondas" / "Handicap do Jogo" / "Handicap de Rounds" → mercado correspondente do cadastro
+   - "Vencedor do Mapa" / "ML Mapa" / "Map Winner" → "ML Mapa" (se cadastrado, DIFERENTE de "Vencedor" / "ML" genérico)
+   - "Resultado/Ambos Marcam" / "Ambos Marcam" / "Both Teams to Score" → mercado do cadastro
+   - "Jogador a Marcar" / "Jogador a Dar Assistência" / "Marca Gol" → mercado do cadastro
+   Fazer match semântico com a lista de Mercados cadastrada (incluindo traduções: "Anytime Goalscorer" ↔ "Anytimes", "Match Winner" ↔ "Resultado Final", etc). JAMAIS retornar "ML" ou null quando há rótulo explícito da casa no print.
+
+   ESPECIFICIDADE IMPORTA: "Chutes" ≠ "Chutes no gol" ≠ "Chutes a gol". Cada um é um mercado distinto. Nunca generalizar ou especificar além do que o rótulo literal do print indica. "Total chutes" mapeia pra "Chutes" (geral). "Chutes no gol" / "Shots on target" mapeia pra "Chutes no gol" (específico).
+
+[R6] TIPO DE APOSTA — SIMPLES É O DEFAULT: se há 1 seleção = Simples. Só desvie dessa regra quando houver SINAL INEQUÍVOCO:
+   - Palavra "CRIAR APOSTA"/"BET BUILDER" escrita OU sinais estruturais de bet builder (ver R2) → Criar Aposta
+   - Palavra "DUPLA"/"TRIPLA"/"MÚLTIPLA"/"Múltipla" escrita + múltiplas seleções + uma odd total → tipo correspondente
+   - Marcador de bônus ("SUPER AUMENTADA", "APOSTA AUMENTADA") → Super Aumentada (se cadastrado)
+   Sem esses sinais, mesmo com layouts complexos ou múltiplas linhas visuais, é Simples.
+
+[R8] ODD DA DESCRIÇÃO PREVALECE SEMPRE SOBRE ODD DO PRINT. Quando a descrição do operador contém "odd X.XX" ou "odd X,XX" (palavra "odd" literal seguida de valor, incluindo typos "od", "ood", "odds"), esse valor SUBSTITUI a odd do print. Sem exceção. Motivos comuns: drops ao vivo, bônus aplicado no print, odd real pega divergindo do sugerido.
+   Exemplo: print mostra "Odds: 2.50" e descrição diz "365 deia odd 2,37" → odd: 2.37 (NÃO 2.50).
+   Exemplo: print mostra "1.79x" e descrição diz "pinnacle odd 1.746" → odd: 1.746.
+   
+   IMPORTANTE — ODD DA LEGENDA DO TIPSTER: quando a legenda do tipster contém "Odds: X.XX" ou "Odd: X.XX" em linha rotulada (ex: "Stake: 0.50u\nOdds: 3.40"), esse é o valor primário de odd. NUNCA deixe odd em 0 quando há "Odds: X.XX" ou "Odd: X.XX" no texto — extraia diretamente.
+
+[R9] "BH" NO CABEÇALHO = "BH CS" + COUNTER-STRIKE. Quando o cabeçalho do print contém "BH" (tipicamente "BH Tipster"), o tipster é SEMPRE "BH CS" e o esporte é SEMPRE Counter-Strike. Essa regra tem prioridade absoluta sobre outros identificadores no mesmo cabeçalho (ex: "@GuiaDasApostas" no final não muda o tipster pra GDA quando há "BH" no início).
+
+[R9.1] "Projeto Fezinha" NO CABEÇALHO = SEMPRE 1 APOSTA MÚLTIPLA, NUNCA INDIVIDUAIS. Tipsters do Projeto Fezinha SÓ enviam combinadas — nunca são feitas as entradas individuais. Regra:
+   - Cabeçalho contém "Projeto Fezinha" ou "Fezinha" → gere EXATAMENTE 1 aposta no array, tipo_aposta conforme número de seleções: 2=Dupla, 3=Tripla, 4+=Multipla.
+   - NUNCA gere 1 aposta por seleção mesmo se o bilhete mostrar cada jogo listado com sua própria odd.
+   - NUNCA gere individuais + 1 múltipla (duplicação). Retorne SOMENTE a múltipla.
+   - Campo odd = "Odd total" do bilhete (SEMPRE presente, geralmente no rodapé: "Odd total 142.62", "Múltipla de 6 = 107.90", etc).
+   - Campo stake_unidades = única stake do bilhete (geralmente no rodapé: "0.15", "Valor apostado 0.15").
+   - Campo entrada = seleções concatenadas separadas por " + " (ex: "Menos de 7.5 + Mais de 29.5 + Mais de 0.5 + ..."). Mantenha curto.
+   - Campo evento = "Múltipla" (simples, sem concatenar nomes de jogos).
+   - Campo mercado = "Múltiplos" se houver mercados variados.
+   - Campo esporte = null se houver esportes mistos.
+
+[R9.5] LEGENDA DO TIPSTER E/OU DESCRIÇÃO DO OPERADOR SÃO FONTES PRIMÁRIAS DE SELEÇÃO. Quando o bilhete mostra múltiplas opções (ex: Resultado Final 1x2 com Bahia 1.80 / Empate 3.60 / Santos 4.50, Over/Under, handicaps) SEM destaque visual de qual foi escolhida, a SELEÇÃO REAL deve sair DUMA destas fontes (em ordem de prioridade):
+   1. **DESCRIÇÃO DO OPERADOR** (mais confiável quando presente). Padrões comuns:
+      - "[bookie] [conta] - [seleção]" (ex: "365 will - bahia")
+      - "[seleção] @[odd]" (ex: "bahia @1.80")
+      - Time/jogador/resultado mencionado claramente entre as palavras-chave do operador.
+   2. **LEGENDA DO TIPSTER** (texto abaixo ou próximo do bilhete). Padrões comuns: "[seleção] @[odd] / [stake]" ou "[seleção] @[odd]" ou linha narrativa "[seleção] vence".
+
+   - Exemplo 1: bilhete mostra Bahia 1.80 / Empate 3.60 / Santos 4.50 e descrição diz "365 will - bahia 1.80" → entrada: "Bahia", odd: 1.80, mercado: ML.
+   - Exemplo 2: bilhete Over/Under 2.5 com ambas odds visíveis e legenda "Under 2.5 @1.95 / 0.5u" → entrada: "Under 2.5", odd: 1.95, stake_unidades: 0.5.
+   - Exemplo 3: bilhete 1x2 sem destaque e legenda "Empate @3.20" → entrada: "Empate", odd: 3.20.
+   - Exemplo 4: bilhete handicap visual mostra opções diferentes e descrição diz "ellian buse -4.5 odd 1.92 - 1u" → entrada: "Buse -4.5", odd: 1.92, stake_unidades: 1, conta: "ellian".
+
+   NUNCA pegue a primeira odd visível, a odd maior, ou a do meio por default. Se há descrição ou legenda, ELA RESOLVE tudo — entrada, odd e stake saem da informação textual.
+
+[R10] STAKE É DADO CRÍTICO — SEMPRE PROCURAR. Extração de stake deve acontecer SEMPRE. Procure em TODA a imagem (bilhete + legenda do tipster + anotações) E na descrição do operador. Padrões comuns que DEVEM ser extraídos:
+   - "Xu", "X.Yu" (ex: "1u", "0.5u", "1.25u", "0.75u")
+   - "X%" (ex: "0.75%", "1%", "2%") — equivalente a unidades
+   - "@odd / Xu" (ex: "@5.50 / 0.75u", "@1.75 / 1u")
+   - "Stake: Xu", "Stake X", "Stake 0.50u", "Stake: 1u" (linha rotulada em legenda do tipster — SEMPRE extrair)
+   - "Xu - Min XXX", "Xu // Min XXX" (a letra "u" indica stake; "Min X.XX" ao lado é odd mínima, NUNCA interprete "Min" como stake)
+   - "Odds: X.XX" + linha separada "Stake: Yu" ou apenas "Yu" → odd vem de "Odds:" e stake vem do "Yu"
+   - "X unid", "X unidade"
+   - "[entrada] - Xu" (ex: "Buse -4.5 - 1u")
+   - "Xu" sozinho numa linha da legenda do tipster (ex: linhas soltas "LIVE", "1u", "Min - 1.62" — o "1u" É A STAKE, "Min - 1.62" é odd mínima)
+   - Número sozinho em linha (ex: "846" → stake_reais 846)
+   stake_unidades null só é aceitável quando NÃO há absolutamente nenhum número associado a "u", "%" ou "stake" em lugar nenhum.
+   
+   ATENÇÃO: legendas de tipster frequentemente vêm em formato estruturado com linhas rotuladas tipo "Stake: Xu" / "Odds: Y.YY" / "Min: Z.ZZ". Esses rótulos são FONTE PRIMÁRIA — extraia o valor diretamente da linha rotulada. NUNCA deixe stake em zero quando há "Stake: Xu" ou "Xu" sozinho em linha no texto da mensagem.
+
+[R11] OVERRIDE EXPLÍCITO NA DESCRIÇÃO — "SOMENTE / APENAS / SÓ":
+   Quando a descrição do operador contém uma instrução explícita restringindo o tipo de aposta a registrar, essa instrução TEM PRIORIDADE ABSOLUTA sobre qualquer detecção visual e prevalece sobre R2, Cenário 2 e Cenário 4.
+
+   PADRÕES QUE DISPARAM A REGRA (case-insensitive, considerar variações):
+   - "SOMENTE [tipo]", "APENAS [tipo]", "SÓ [tipo]", "só [tipo]"
+   - "[tipo] aqui", "registrar só [tipo]", "anotar só [tipo]"
+   - Onde [tipo] ∈ {dupla, tripla, múltipla, combinada, individuais, individual, simples}
+
+   COMPORTAMENTO:
+   - "SOMENTE dupla" / "apenas dupla" / "só a dupla" / "registrar só a dupla" → retornar APENAS 1 aposta tipo Dupla. NÃO criar simples individuais. NÃO criar com stake zero. As seleções individuais NÃO ENTRAM na resposta de jeito nenhum.
+   - "SOMENTE tripla" / "só tripla" → APENAS 1 aposta tipo Tripla.
+   - "SOMENTE múltipla" / "só a múltipla" / "só combinada" → APENAS 1 aposta tipo Múltipla / Dupla / Tripla (conforme número de seleções).
+   - "SOMENTE individuais" / "só simples" / "só as individuais" → ignora a combinada, retorna SÓ as N apostas simples.
+
+   EXEMPLO REAL (bilhete BH CS):
+   Bilhete mostra: Snayder Porozo @3.75 + Adalid Terrazas @4.33 + Dupla @16.25 com R$ 90,00 apostado.
+   Descrição do operador: "365 luis / MM Staking / apenas dupla aqui"
+   → Retornar EXATAMENTE 1 aposta:
+     {{"tipo_aposta": "Dupla", "evento": "Dupla", "entrada": "Snayder Porozo + Adalid Terrazas", "odd": 16.25, "stake_reais": 90, "contas_utilizadas": "luis"}}
+   → NUNCA criar duas Simples adicionais (com stake 0 ou qualquer valor). A descrição é override explícito.
+
+   QUANDO NÃO HÁ INSTRUÇÃO "SOMENTE/APENAS/SÓ":
+   - A regra R11 não se aplica. Use Cenário 2/4 normal.
+
+   ATENÇÃO: a palavra "só" pode aparecer em outros contextos ("só funcionou no live", "só esse mercado tem"). Aplicar R11 SOMENTE quando "só / apenas / somente" vem ANTES de uma palavra de tipo de aposta (dupla, tripla, múltipla, combinada, individuais, simples).
+
+[R7] CHECKLIST FINAL ANTES DE RESPONDER: antes de emitir o JSON, verifique mentalmente:
+   - Descrição contém "SOMENTE/APENAS/SÓ + [dupla/tripla/múltipla/combinada/simples/individuais]"? → R11 é ABSOLUTA: retornar APENAS o tipo solicitado, ignorar resto.
+   - O print tem "CRIAR APOSTA"/"BET BUILDER" escrito OU sinais estruturais de bet builder? → 1 item só. Se NÃO, não invente.
+   - Print tem palavra "DUPLA/TRIPLA/MÚLTIPLA" + odd combinada visível + R$ único apostado? → DEFAULT é 1 aposta combinada (Cenário 4). Só gere individuais separadas se a descrição indicar EXPLICITAMENTE que cada uma foi apostada.
+   - Data que coloquei veio de texto EXPLÍCITO do print/descrição? → Se não, use a DATA DE HOJE do contexto.
+   - Times conhecidos? → Esporte marcado (específico se existir, NBA/WNBA/Futebol Feminino/etc).
+   - Descrição começa com bookie? → Preenchi o bookie.
+   - Palavra após bookie? → Preenchi a conta (CRÍTICO).
+   - Rótulo da casa no bilhete? → Preenchi o mercado via match semântico.
+   - Bilhete mostra múltiplas opções (1x2, Over/Under) sem destaque visual? → Usei a LEGENDA DO TIPSTER **e/ou DESCRIÇÃO DO OPERADOR** pra definir entrada/odd/stake. Não peguei odd aleatória.
+   - Legenda do tipster tem "Stake: Xu" ou "Xu" sozinho em linha? → stake_unidades PREENCHIDA (NUNCA zero).
+   - Legenda do tipster tem "Odds: X.XX"? → odd PREENCHIDA (NUNCA zero).
+   - "Xu" ou "X%" em QUALQUER parte do texto? → Preenchi stake_unidades.
+   - Descrição tem "odd X.XX"? → USEI esse valor, não o do print.
+   - Tipo_aposta: 1 seleção sem marcador = Simples. Não inventar Criar Aposta.
+
+═══════════════════════════════════════════════════════════════
+
+REGRAS DETALHADAS:
+
+A. OPERADOR: use o nome "{operador_msg}" (quem enviou o print). Se bater com algum nome da lista de operadores, use o nome exato do cadastro. Se não bater, deixe como está.
+
+B. TIPSTER: deduza pelo cabeçalho/título do print. O nome que aparece no cabeçalho pode ser:
+   (i) o nome do GRUPO diretamente (ex: "BH Tipster" → "BH CS")
+   (ii) um USUÁRIO/APELIDO que assina o print em nome do grupo (ex: "Italo Cards" aparece no print mas o grupo está cadastrado como "Italo Cartões")
+   (iii) o nome ESTILIZADO com separadores decorativos — pontos, traços, espaços entre letras (ex: "P.R.O.P.H.E.T" → "PROPHET", "J D F - V I P" → "JDF-VIP", "S.E.T.T.A" → "SETTA"). NORMALIZE removendo pontos, hífens e espaços extras antes de comparar com a lista.
+   (iv) MÚLTIPLOS NOMES unidos por "&", "|", "/", "+", "e" (ex: "Syro & GuiaDasApostas", "NBA 25/26 | Live | Syro & GuiaDasApostas"). Nesse caso, tente casar CADA palavra/nome individualmente com a lista — o cadastro pode usar só parte do nome, abreviações ou reordenação (ex: "Syro & GuiaDasApostas" pode estar cadastrado como "GDA Syro", "Syro GDA", "Syro", etc). Se alguma palavra casa, use o nome exato do cadastro.
+   (v) COM DECORAÇÕES VISUAIS (bandeiras, emojis, ícones, separadores decorativos). Ex: "O Apostador 🇧🇷🇬🇧 - Free eSports 🎮", "Vôlei - Staking - @Guia", "VIP Tradicional - @GuiaDasApostas". IGNORE as decorações visuais (emojis, bandeiras) e extraia APENAS os termos textuais como candidatos a tipster. Do exemplo "O Apostador 🇧🇷🇬🇧 - Free eSports 🎮", os candidatos são: ["O Apostador", "Free eSports"] — tente ambos no match.
+   (vi) COM "@[palavra]" indicando handle/identificador do tipster (ex: "@Guia", "@GuiaDasApostas", "@Syro"). A palavra após o "@" é um identificador forte — use ela no match por tokens contra a lista de tipsters.
+
+   CONHECIMENTO DE DOMÍNIO SOBRE SIGLAS:
+   - "GDA" = abreviação de "GuiaDasApostas". Portanto, cabeçalhos contendo "GuiaDasApostas", "Guia Das Apostas", "Guia", "@Guia", "@GuiaDasApostas", "@GDA" DEVEM casar com tipsters cadastrados que começam com "GDA " (ex: "GDA Syro", "GDA Vôlei", "GDA Tradicional", "GDA CS"). Use o contexto (esporte, mercado) pra decidir qual GDA exato se houver múltiplos.
+   - "BH" pode ser prefixo de "BH Tipster" → tipsters cadastrados que começam com "BH " (ex: "BH CS")
+
+   Quando houver similaridade temática entre o nome no print e um item da lista (cards ↔ cartões, traduções, abreviações, variações), PRIORIZE o match do cadastro em vez de usar o texto literal do print. Use o nome EXATAMENTE como está na lista de tipsters.
+   Se aparecer "GOA", pode ser "GOA TOM", "GOA Fut Fem", "GOA Tradicional" — use o contexto da aposta (esporte, tipo de mercado) pra decidir qual.
+
+C. ESPORTE: INFIRA por COMBINAÇÃO DE SINAIS (nome de time + mercado + torneio + contexto). NUNCA decida esporte baseado apenas em um nome de time, porque nomes são ambíguos:
+   - "Fluminense" pode ser futebol, vôlei, basquete — precisa mercado ou contexto pra decidir
+   - "Flamengo" pode ser futebol ou basquete — idem
+   - "Barça eSports" existe em LOL, CS, Valorant, etc — precisa termo específico do jogo
+   Só infira esporte quando houver PELO MENOS 2 SINAIS CONVERGENTES. Se houver só um nome isolado sem mais pistas, deixe null.
+
+   SINAIS DE MERCADO que identificam o esporte:
+   - Futebol: "gols", "escanteios", "cartões" (Mais/Menos de X.5), "ambos marcam", "anytime goalscorer", "marcar a qualquer momento", "qualificar-se", "resultado final" em contexto de clube
+   - Basquete: "pontos", "rebotes", "assistências", "bloqueios" (do jogador), "pontos totais do jogo"
+   - Counter-Strike (CS): "Mapa 1/2/3", "rondas" (ou "rodada"), "kills", "CT/TR", "pistol round", "handicap de rondas"
+   - League of Legends (LOL): "barão", "dragão", "nashor", "torres", "inibidores", "first blood", "first lane"
+   - DOTA 2: "roshan", "rax", "creep score", "first blood" em contexto DOTA
+   - Valorant: "agentes" específicos (Jett, Omen, Phoenix), "plant", "defuse" sem contexto CS
+   - Tênis: "sets", "games", "aces", "break points"
+   - F1/Automobilismo: "volta mais rápida", "pole", "podium"
+   - Os esports citados são os mais comuns mas NÃO são lista fechada — se identificar outro (Rocket League, KoF, etc), use o nome correto.
+
+   SINAIS DE TORNEIO/LIGA também ajudam: "Champions League", "Premier League", "NBA", "LEC", "LPL", "CBLOL", "Major CS", etc.
+
+   REGRA FINAL: se houver mercado genérico ("Match Winner", "Moneyline", "Vencedor 2-Way") SEM outro sinal que identifique o esporte, deixe null. É melhor null do que chutar.
+
+   Use o nome do esporte EXATAMENTE como aparece no cadastro.
+
+D. DATA DO EVENTO — prioridade de fontes (use a primeira disponível):
+   1. DATA EXPLÍCITA NO PRINT: se o print mostra a data em qualquer formato ("21/04/2026", "21 abr", "Data: 2026-04-21 15:45:00", "Entrada para 21/04/2026"), extraia essa data como YYYY-MM-DD.
+   2. DATA EXPLÍCITA NA DESCRIÇÃO: se o operador escreveu uma data na descrição, use essa.
+   3. "LIVE" ou "AO VIVO" no print: a partida é HOJE (usar DATA DE HOJE do contexto).
+   4. Nenhum dos anteriores: use a DATA DE HOJE do contexto como fallback.
+   NUNCA infira data de evento por conhecimento prévio de calendário esportivo — o Claude Vision não tem acesso a dados em tempo real e pode errar. Só use datas que estejam EXPLICITAMENTE escritas no print ou na descrição.
+
+   CUIDADO — IDENTIFICADORES DE GRUPO/TEMPORADA NÃO SÃO DATAS: strings em formato "AAAA.MM [texto]", "T[N]", "Season [N]", "[AAAA].[MM] [nome]" no cabeçalho, logo ou nome do canal do tipster são identificadores de grupo/temporada, NÃO são data do evento. Exemplos:
+   - "2026.03 Courtside" → nome do grupo, NÃO é data 2026-03-XX
+   - "T03 Esports" → temporada 3 do grupo, NÃO é 03/XX/2026
+   - "Season 26.03" → idem
+   Data válida deve estar rotulada ("Data:", "Jogo em:", "Entrada para:", "LIVE") OU aparecer dentro do bilhete em formato inequívoco com dia/mês/ano (ex: "21/04/2026 15:45") ou sendo óbvia a relação com a partida.
+
+E. STAKE (prioridade absoluta: DESCRIÇÃO DO OPERADOR > PRINT):
+
+   SINAIS DE UNIDADE EM QUALQUER FONTE (print OU descrição): letra "u" ("2u", "1.5u", "0.5unidade", "0.75 unid") e sinal "%" ("0.75%", "1.5%", "2%") são sinais EQUIVALENTES e ambos representam UNIDADES. Aplique em qualquer texto/número que esteja na imagem (bilhete, legenda do tipster, anotações) ou na descrição do operador.
+
+   EXTRAÇÃO É IMPRESCINDÍVEL — reconheça "Xu" ou "X.Yu" ou "X%" em QUALQUER posição do texto, independente do formato ao redor. Padrões comuns que DEVEM ser extraídos (não ignorar nenhum):
+   - "0.75u" sozinho em linha
+   - "Stake: 0.75u"
+   - "Odds: 2.62 / 0.75u"
+   - "@5.50 / 0.75u" (formato comum em bilhetes com tipster estilizado)
+   - "Buse -4.5 - 1u" (valor no final com múltiplos traços)
+   - "0.5u — Vale até X" (valor seguido de nota)
+   - "1% - limite 50" (% no início, seguido de limite)
+   - "0.75 unidade" / "0.75 unid"
+   - "1.5u" dentro de um texto corrido
+   - "Min-1.60 Stake 0.5u" (combinado com outras infos)
+   Menções de alternativas ("Vale até X", "também pode pegar Y") NÃO alteram o stake principal. A stake é o número que está visivelmente associado a "u" ou "%".
+
+   CASO 1 — valor vem do PRINT (operador não falou de stake na descrição): preencha stake_unidades com o valor numérico. Considere TODO o texto da imagem (bilhete + legenda + anotações do tipster), não só o campo de stake da interface da casa. Exemplos:
+   - "2u" → stake_unidades: 2
+   - "0.5u" → stake_unidades: 0.5
+   - "0.75%" escrito abaixo do bilhete → stake_unidades: 0.75
+   - "1% - limite 50" → stake_unidades: 1
+   - "R$ 2" no bilhete da casa → stake_unidades: 2 (convenção do tipster, NÃO é dois reais)
+   - "R$ 0,5" no bilhete da casa → stake_unidades: 0.5 (convenção do tipster, NÃO é cinquenta centavos)
+   Nunca faça conversão de moeda neste caso — apenas extraia o número pra stake_unidades.
+
+   CASO 2 — operador informou stake na DESCRIÇÃO: a descrição PREVALECE sobre o print. Interprete conforme o operador escreveu, distinguindo unidades de reais pelos sinais:
+   - SINAIS DE UNIDADES → preencher stake_unidades: letra "u" no valor ("1u", "1.5u"), sinal "%" no valor ("0.50%" = 0.5u, "1%" = 1u, "2%" = 2u — "%" é sinônimo de unidade em alguns tipsters), valores baixos típicos (0.5, 1, 2, 3, 5).
+     Exemplos: "apostei 1u" → stake_unidades: 1 / "2u total" → stake_unidades: 2 / "0.50%" → stake_unidades: 0.5
+   - SINAIS DE REAIS → preencher stake_reais: palavras "total", "R$", "reais", "em reais", ou valores altos sem "u" nem "%" (ex: 400, 1000, 250).
+     Exemplos: "400,00 total" → stake_reais: 400 / "apostei R$ 250" → stake_reais: 250 / "1000 em reais" → stake_reais: 1000
+   - Preencha APENAS UM dos dois campos (stake_unidades OU stake_reais), nunca os dois ao mesmo tempo.
+   - Em caso de ambiguidade real, prefira stake_unidades.
+   
+   IMPORTANTE — descrição com MÚLTIPLAS LINHAS de stake: se o operador mandar várias linhas, cada linha (ou par de linhas) geralmente corresponde a UMA aposta diferente. Exemplos:
+
+   FORMATO A — uma linha por aposta (stake e identificador juntos):
+   "0.50%     (linha 1 → stake da aposta 1)
+    0.50%     (linha 2 → stake da aposta 2)
+    0.10% @39.48   (linha 3 → stake da aposta 3, a @odd identifica qual aposta)"
+
+   FORMATO B — par de linhas por aposta (conta/bookie + stake/odd):
+   "gabi betano     (linha 1 → identifica aposta 1: conta 'gabi' na Betano)
+    487,35 1.90    (linha 2 → stake_reais: 487.35, odd de confirmação: 1.90)
+    mcgames        (linha 3 → identifica aposta 2: bookie MCGames)
+    312,65 1.85"   (linha 4 → stake_reais: 312.65, odd: 1.85)
+   → 2 apostas: aposta 1 (Betano, gabi, stake_reais 487.35, odd 1.90) e aposta 2 (MCGames, stake_reais 312.65, odd 1.85). Valores altos como 487.35 e 312.65 SÃO REAIS, não unidades — preencha stake_reais.
+
+   Mapeie linha por linha pras apostas correspondentes do print.
+
+F. BOOKIE e CONTAS: vêm da descrição do operador, podem aparecer em qualquer ordem.
+   - CONTA É DADO CRÍTICO: sempre tente extrair. Qualquer palavra não-reservada próxima ao bookie é conta. Palavras reservadas: "in", "out", "odd", "ood", "od", "odds", e números. Tudo o mais é candidato a conta.
+   - NOMES COMUNS DE CONTA (extrair SEMPRE que aparecerem na descrição): marta, will, deia, dany, ellian, nicolas, greice, leite, danyel, sorgetz, reis, kapola, vini, roger, gabi, fejao, gabriel, edson, william, chay, luciadritrich, deiav, cromo, dudu, phgpedrinho, dudulemos, geospich, pedrinho, maiato, cassiel, lucia. Essa lista NÃO é exaustiva — qualquer nome próprio ou apelido curto após bookie deve ser tratado como conta.
+   - PALAVRAS QUALITATIVAS (não são contas específicas): quando a descrição tem "Todas", "Várias", "All", "Geral" antes ou depois do bookie (ex: "Todas AG - 846 odd 1,89"), isso indica uso genérico de várias contas SEM especificar quais. Deixe contas_utilizadas null E CONTINUE extraindo normalmente os outros campos (bookie, stake, odd). NÃO deixe essa palavra bloquear a extração dos tokens seguintes.
+     Exemplo: "Todas AG - 846 odd 1,89" → bookie: Aposta Ganha, contas: null, stake_reais: 846, odd: 1.89.
+   - ATENÇÃO — BOOKIE DO PRINT ≠ BOOKIE DA APOSTA: quando o print do TIPSTER mostra "LINK:", "Casa:", "Disponível em:", "Código:", ou um link de uma casa (ex: "https://www.bet365.com/..."), isso indica apenas ONDE O TIPSTER ACHOU A ODD, NÃO onde o operador efetivamente apostou. O bookie REAL da aposta SEMPRE vem da descrição do operador. Se a descrição menciona uma casa diferente da do print, a descrição PREVALECE sem exceção.
+     Ex: print do PROPHET mostra "LINK: Superbet" e descrição do operador diz "betfair dany 2.20" → bookie: Betfair, conta: dany. NÃO Superbet.
+   - PADRÕES COMUNS: "[bookie] [conta]" (ex: "bet365 luciadritrich", "365 deia", "365 marta", "cassino greice") OU "[conta] [bookie]" (ex: "ellian betano", "dany betfair"). Interprete flexível.
+   - BOOKIES CONHECIDOS (lista extensível): Bet365, Betano, Betfair, BETBRA, BetFast, BetVIP, Betfair, Pinnacle, Cassino, vBet (ou VBet), PixBet (ou BetPix, BetPix365), VaideBet, Aposta Ganha, Superbet, Stake, Esportes da Sorte, Rei do Pitaco, Sportingbet, KTO, entre outros. Qualquer palavra na descrição que pareça nome de casa deve ser considerada.
+   - ABREVIAÇÕES DE BOOKIE (conservadoras, só use quando inequívoco):
+     * "365" → Bet365
+     * "AG" → Aposta Ganha
+   - NOTAÇÃO `[conta]+N`: significa "conta X + N outras contas" (ex: "ellian+1", "reis+1", "dany+2"). PRESERVE LITERAL no campo contas_utilizadas, não expanda.
+   - CONTAS MÚLTIPLAS: quando a descrição lista várias contas da mesma casa separadas por "+" (ex: "ellian + nicolas", "gabriel + william + edson"), preencha o campo contas_utilizadas concatenado ("ellian + nicolas").
+   - Se a casa só aparece sozinha sem conta, preencha bookie e deixe contas null.
+   - Se só aparece a conta sem bookie, preencha contas e deixe bookie null.
+
+F2. ODD REAL NA DESCRIÇÃO: quando a descrição contém explicitamente "odd X.XX" ou "odds X.XX" ou um valor numérico isolado/par de valores que claramente represente odd (ex: "3.80" depois da stake, ou "373,44 1.72" no Formato B onde 1.72 é a odd), esse valor PREVALECE sobre a odd mostrada no print. É a odd real que o operador conseguiu pegar na casa (odds caem em live, por exemplo).
+
+F3. ODD COM BÔNUS DA CASA: quando o print contém marcadores de bônus explícitos, a odd exibida no print está COM o bônus aplicado — NÃO é a odd real da aposta. Marcadores típicos:
+   - "GANHOS AUMENTADOS DE X%"
+   - "BOOST +X%", "ODD BOOSTED", "SUPER ODDS"
+   - "APOSTA TURBINADA", "SUPER AUMENTADA", "AUMENTO DE X%"
+   - Ícones com setas/chamas indicando aumento de odd
+   - Exibição de duas odds lado a lado com seta entre elas (ex: "2.10 >> 3.00" — a odd original 2.10 virou 3.00 com bônus; a REAL da aposta é 2.10 se não houver outra info, ou a odd que o tipster/operador informar na descrição)
+   Regra: quando houver marcador de bônus E a descrição informar uma odd, use a odd da DESCRIÇÃO sem hesitar. Ela representa a odd real (sem bônus) que deve ser registrada.
+
+G. QUANTAS APOSTAS RETORNAR — QUATRO CENÁRIOS (CRÍTICO, fonte comum de erro):
+
+   ATENÇÃO PRELIMINAR — REGRA R11 SEMPRE PRIMEIRO: se a descrição do operador contém "SOMENTE/APENAS/SÓ + [tipo de aposta]", PARE AQUI e siga R11. Os cenários abaixo só se aplicam quando NÃO há instrução explícita.
+
+   Primeiro, verifique se há MARCADOR EXPLÍCITO DE COMBINADA: o print contém a palavra "DUPLA", "TRIPLA", "MÚLTIPLA", "COMBO", "ACUMULADA", "TRIPLE", "DOUBLE", "ACCUMULATOR" + uma ODD TOTAL calculada + UM ÚNICO valor apostar/valor apostado + UM ÚNICO possível ganho? Se SIM, o DEFAULT é Cenário 4 (1 aposta combinada). Só vá pro Cenário 2 (paralelas) se houver SINAL EXPLÍCITO de que cada individual também foi apostada (ex: descrição lista cada uma com sua própria conta + stake separadamente, ou bilhete mostra múltiplos botões "Apostar"). NA DÚVIDA, é Cenário 4. Combinada com odd combinada visível NUNCA gera as individuais junto, a não ser que o operador explicitamente diga.
+
+   Caso contrário, CONTE no print: quantas odds DISTINTAS aparecem? Cada odd é uma potencial aposta.
+
+   CENÁRIO 1 — Bet Builder / "Criar Aposta" (1 aposta):
+   Várias seleções DO MESMO JOGO com UMA ÚNICA odd combinada e UM ÚNICO botão APOSTAR.
+   IDENTIFICADORES EXPLÍCITOS (quando aparecerem, tipo_aposta = "Criar Aposta" SEM hesitar):
+   - Palavra "CRIAR APOSTA" (em destaque, maiúsculas)
+   - "BET BUILDER"
+   - "ACUMULADOR DO JOGO"
+   - "JOGO DO SEU JEITO"
+   - "MEU BILHETE", "BILHETE DA CASA"
+   - Ícone de construção/lego ao lado do bilhete
+   ENTRADA (CRÍTICO): concatene TODAS as seleções do bet builder separadas por vírgula, NUNCA apenas a primeira.
+   Ex 1: Donovan Clingan 15+ pontos + 12+ rebotes + 2+ assistências, odd 28.76, apostar R$ 0,5 → 1 item:
+   - tipo_aposta: "Criar Aposta"
+   - entrada: "Donovan Clingan 15+ pontos, 12+ rebotes, 2+ assistências" (TODAS as 3 seleções)
+   - odd: 28.76
+   Ex 2: bilhete POR x SA com 3 seleções (Mais de 221.5 Pontos Total, POR Trail Blazers Mais de 91.5, SA Spurs Mais de 102.5), odd 2.05, apostar R$ 250 → 1 item:
+   - tipo_aposta: "Criar Aposta"
+   - entrada: "Mais de 221.5 Pontos (Total), POR Trail Blazers Mais de 91.5 Pontos, SA Spurs Mais de 102.5 Pontos" (TODAS as 3)
+   - odd: 2.05 (ou a odd real da descrição se houver bônus)
+
+   CENÁRIO 2 — Apostas paralelas no mesmo print (N apostas):
+   Várias seleções, cada uma com sua ODD INDIVIDUAL visível, possivelmente com uma linha/seção adicional "Dupla/Tripla/Múltipla" mostrando uma ODD COMBINADA SEPARADA. Cada odd individual = 1 aposta simples potencial. A odd combinada = 1 aposta ADICIONAL.
+   ATENÇÃO: quando o print mostra N odds individuais E uma seção destacada ao final tipo "Dupla", "Tripla", "Múltipla" com sua PRÓPRIA odd combinada (ex: "Tripla 104.50"), existem N+1 APOSTAS POTENCIAIS, não N nem 1. Ex: 3 jogadores com odds individuais 11.00, 4.00, 6.00 + "Dupla 66.00" no final = 3 simples + 1 dupla = 4 apostas potenciais. A descrição diz quais efetivamente aconteceram.
+   A DESCRIÇÃO DO OPERADOR determina quais apostas foram efetivamente realizadas (tipicamente todas, mas pode ter "out" marcando que pulou alguma — ver regra M).
+
+   Ex: Print mostra:
+   - Vitória (F) — odd 9.75
+   - Chapecoense — odd 4.05
+   - Dupla = 1 — odd 39.48
+   Descrição: "0.50% / 0.50% / 0.10% @39.48 / dupla ellian / chape ellian / vitória ellian"
+   → Retornar 3 apostas:
+     1. tipo_aposta: "Simples", entrada: "Vitória (F)", odd: 9.75, stake_unidades: 0.5, contas_utilizadas: "ellian"
+     2. tipo_aposta: "Simples", entrada: "Chapecoense", odd: 4.05, stake_unidades: 0.5, contas_utilizadas: "ellian"
+     3. tipo_aposta: "Dupla", evento: "Dupla", entrada: "Vitória (F) + Chapecoense", odd: 39.48, stake_unidades: 0.1, contas_utilizadas: "ellian"
+
+   Use pistas da descrição pra mapear: "@39.48" identifica a aposta pela odd, "dupla" identifica tipo, nomes mencionados ("chape", "vitória") identificam qual seleção.
+
+   CENÁRIO 3 — Aposta única simples (1 aposta):
+   Uma seleção, uma odd, um valor apostar. Retorne 1 item.
+
+   CENÁRIO 4 — Combinada explícita da casa (1 aposta única):
+   O print mostra MÚLTIPLAS seleções com odds individuais visíveis, MAS há sinais claros de que é UMA única aposta combinada:
+   - Palavra explícita "TRIPLA", "DUPLA", "MÚLTIPLA", "Múltipla de N seleções", "COMBO", "ACUMULADA" no print
+   - OU marcadores de oferta especial: "APOSTA AUMENTADA", "SUPER AUMENTADA", "GANHOS AUMENTADOS", "ODD BOOSTED", "APOSTA TURBINADA"
+   - Uma ODD TOTAL/COMBINADA calculada (ex: "Odd total 15.10" ou odd única em destaque)
+   - UM ÚNICO valor apostado (ex: "R$ 0.25", "APOSTE JÁ R$0,25")
+   - UM ÚNICO possível ganho/retorno (ex: "Ganhos Potenciais R$ X")
+   - NENHUM campo de stake ou botão "Apostar" individual por seleção (as seleções aparecem apenas como lista informativa)
+
+   CRITÉRIO DECISIVO CENÁRIO 2 vs CENÁRIO 4 (CRÍTICO):
+   - Cenário 2 (N+1 apostas): cada seleção tem seu PRÓPRIO campo de stake, botão de apostar, valor individualizado. O print permite apostar em cada uma separadamente.
+   - Cenário 4 (1 aposta só): apenas a combinada tem stake/valor. Seleções individuais são lista informativa, sem campo próprio de aposta.
+   Se a descrição do operador só menciona UMA casa/conta (ex: "betano ellian") e o print mostra marcador de combinada + stake única, é SEMPRE Cenário 4.
+
+   No Cenário 4, retorne 1 item único:
+   - tipo_aposta: ver regra I (marcador de bônus tem precedência sobre contagem de seleções)
+   - evento: apenas "Dupla" / "Tripla" / "Múltipla" (conforme o tipo). NÃO concatenar nomes de jogos.
+   - entrada: concatenar as seleções separadas por " + " (ex: "Corinthians e Sim + Vasco da Gama e Sim" ou "Mais de 9.5 Chutes + Menos de 33.5 Total de gols + CS Minaur +1.5 Handicap")
+   - mercado: se os mercados forem iguais em todos os jogos, preencher (match semântico); se mistos, usar "Múltiplos"
+   - esporte: se todos os jogos são do mesmo esporte, preencher. Se mistos (ex: Futebol + Futebol Feminino, NBA + WNBA, CS + LOL), null.
+   - odd: a odd total/final (ex: 27.50)
+   - stake: o único valor do bilhete
+
+   Ex 1: Print com 3 seleções de futebol, odd total 15.10, 0.50u apostado → 1 item:
+   {{"tipo_aposta": "Tripla", "evento": "Tripla", "entrada": "RC Lens Menos de 1.5 + Girona Mais de 0.5 + Brighton Mais de 2.5", "odd": 15.10, "stake_unidades": 0.5, "esporte": "Futebol", "mercado": null}}
+
+   Ex 2: Print com "APOSTA AUMENTADA" + 2 seleções de futebol, odd 27.50, R$50 apostado → 1 item:
+   {{"tipo_aposta": "Super Aumentada", "evento": "Dupla", "entrada": "Corinthians e Sim + Vasco da Gama e Sim", "odd": 27.50, "stake_reais": 50, "esporte": "Futebol", "mercado": "Ambos Marcam"}}
+
+   Ex 3: Print com "TRIPLA (B x M / B x H x S)" + 3 seleções mistas + odd 8.83 + R$ 0.25 → 1 item:
+   {{"tipo_aposta": "Tripla", "evento": "Tripla", "entrada": "Mais de 9.5 Chutes + Menos de 33.5 Total de gols + CS Minaur +1.5 Handicap", "odd": 8.83, "stake_unidades": 0.25, "esporte": null, "mercado": "Múltiplos"}}
+
+   REGRA-CHAVE: marcador explícito de combinada OU de bônus + odd total + valor único + ausência de stakes individuais por seleção = Cenário 4 (1 item). Múltiplas odds COM stakes individuais por seleção = Cenário 2 (N itens mapeados pela descrição). Bet builder do mesmo jogo/jogador = Cenário 1.
+
+H. DESCRIÇÃO = N APOSTAS AUTOSSUFICIENTES (importante complemento ao Cenário 2):
+   Quando a descrição contém várias linhas, cada linha representa UMA aposta que se diferencia do bilhete visual em algum aspecto (casa diferente, stake diferente, odd real pega, conta diferente). O número de apostas registradas deve bater com o número de LINHAS ÚTEIS da descrição, não com o número de odds do print.
+   - Campos INFORMADOS na linha → usar os valores da descrição
+   - Campos OMISSOS na linha → herdar do print (seleção, mercado, evento, esporte, etc.)
+   - Mapeamento da seleção: se a descrição tem identificador textual ("dupla", "chape", "vitória", "linha KOLESIE +4.5"), use. Se não, mapeie pela odd (linha com odd 1.72 mapeia pra seleção do print cuja odd é 1.72).
+   - Se o operador escreveu a linha, é porque há algo diferente do print — NUNCA ignore uma linha da descrição assumindo que é redundante.
+
+M. GRAMÁTICA DE ESTADOS POSICIONAIS NA DESCRIÇÃO (padrão crescente de uso):
+   Um padrão comum de descrição é: "[bookie] [conta] [estado_1] [estado_2] [estado_3] ..."
+   Onde cada estado mapeia POSICIONALMENTE para as apostas do print, NA ORDEM em que aparecem (incluindo combinadas listadas ao final do print).
+
+   Estados possíveis:
+   - "out" → operador NÃO apostou essa. NÃO REGISTRAR essa aposta (pular completamente).
+   - "in" → operador apostou essa conforme o print (usa stake e odd do print como estão).
+   - NÚMERO SOZINHO (ex: "105", "105,00", "95.33") → operador apostou essa com STAKE em REAIS igual ao número. Odd segue o print (salvo ajustes por outros estados ou por regras F2/F3).
+   - "odd X.XX" → operador apostou essa com ODD REAL igual a X.XX (sobrescreve a odd do print, típico em drops ao vivo).
+   - Combinações: "105 odd 95.33" → stake_reais 105 + odd 95.33 pra mesma aposta.
+
+   REGRA DE DESAMBIGUAÇÃO CRÍTICA: número SOZINHO sempre é stake em reais; odd SÓ é odd quando precedida da palavra "odd". NUNCA inferir que um número grande é odd sem a palavra "odd" na frente.
+
+   Exemplo: descrição "365 will out in in in 95,33" com print mostrando 3 simples + 1 tripla:
+   - bookie: 365 (Bet365)
+   - conta: will
+   - aposta 1 (1ª simples): "out" → NÃO REGISTRAR
+   - aposta 2 (2ª simples): "in" → registrar com stake/odd do print
+   - aposta 3 (3ª simples): "in" → registrar com stake/odd do print
+   - aposta 4 (tripla): "95,33" → registrar com stake_reais 95.33 (odd da tripla segue o print)
+   Total: 3 apostas registradas (não 4).
+
+   Quando a descrição segue essa gramática, ela é a fonte DEFINITIVA de quais apostas foram feitas. Não invente apostas a mais nem a menos.
+
+   MULTI-CASA NA MESMA LINHA (padrão avançado): a descrição de UMA linha pode conter MÚLTIPLAS apostas na MESMA seleção feitas em casas diferentes. Formato:
+   `[casa1] [conta1a] + [conta1b] [stake1] odd [odd1] + [casa2] [conta2a] + [conta2b] [stake2] odd [odd2] + ...`
+
+   DIFERENCIAÇÃO DO "+" (CRÍTICO):
+   - "+" seguido de NOME DE CASA CONHECIDA (betano, 365, bet365, AG, vbet, pinnacle, betfair, cassino, etc.) → início de NOVA aposta na mesma seleção
+   - "+" seguido de OUTRA PALAVRA (nome de conta, etc.) → conta adicional da mesma casa
+
+   Exemplo: `betano ellian + nicolas 114,00 odd 2.42 + 365 deia + marta 586,00 odd 2.62` → 2 apostas na mesma seleção:
+   1. Betano, contas "ellian + nicolas", stake_reais 114.00, odd 2.42
+   2. Bet365 (via "365"), contas "deia + marta", stake_reais 586.00, odd 2.62
+
+   Exemplo: `betano ellian + nicolas 399,00 odd 2.32 + AG edson + chay + gabriel 287,00 odd 2.14` → 2 apostas:
+   1. Betano, contas "ellian + nicolas", stake_reais 399.00, odd 2.32
+   2. Aposta Ganha (via "AG"), contas "edson + chay + gabriel", stake_reais 287.00, odd 2.14
+
+   NUNCA RETORNE LISTA VAZIA POR COMPLEXIDADE: mesmo que o print+descrição sejam complexos (5+ apostas, múltiplas casas, múltiplas contas), EXTRAIA TUDO que conseguir identificar. Melhor 7 apostas corretas + 2 null do que 0 apostas. Se alguma linha específica for ambígua, extraia as outras que estão claras.
+
+N. PRINTS DE TELA DE CONFIRMAÇÃO DA CASA (R$ é REAL DE VERDADE):
+   Quando o print é claramente uma TELA DE CONFIRMAÇÃO DA CASA DE APOSTAS (não um bilhete do tipster), os valores em R$ são REAIS DE VERDADE, não unidades. Sinais que indicam tela de confirmação:
+   - Mostra "Aposta" ou "Aposta total" + valor em R$ (valor fixo, sem campo editável)
+   - Mostra "Ganhos Potenciais" / "Retornos Potenciais" / "Total de ganhos" + valor em R$
+   - Tem "Mais Detalhes" ou similar
+   - Mostra status tipo "APOSTAS SIMPLES" ou "Aposta Feita"
+
+   Nesse caso, preencha `stake_reais` diretamente com o valor apostado (ex: "R$ 225,00" → stake_reais: 225). O código vai converter pra unidades automaticamente usando o valor da unidade do tipster.
+
+   Diferenciação:
+   - Print do BILHETE PRONTO PRA APOSTAR (botão "Apostar", "Fazer aposta", "MÁX", campo editável "R$ 0,00") → valores "R$" no campo da stake são placeholder/exemplo do tipster (unidades).
+   - Print de APOSTA JÁ CONFIRMADA/FEITA → valores "R$" são reais de verdade.
+
+I. TIPO DE APOSTA — use MATCH SEMÂNTICO com a lista de Tipos de Aposta cadastrados (acima). Use o nome EXATO do cadastro quando reconhecer a intenção.
+
+   HIERARQUIA DE DECISÃO (topo tem precedência):
+   1) MARCADOR EXPLÍCITO DE OFERTA ESPECIAL NO PRINT → use o tipo correspondente do cadastro, IGNORANDO a contagem de seleções. Marcadores que disparam essa regra:
+      - "SUPER AUMENTADA", "APOSTA AUMENTADA", "GANHOS AUMENTADOS" → "Super Aumentada" (se cadastrado)
+      - "APOSTA TURBINADA", "ODD BOOSTED", "SUPER ODDS", "BOOST +X%" → tipo correspondente do cadastro
+      - Transição visual de odd (ex: "21.37 >> 27.50") indicando aumento → idem
+      - "CRIAR APOSTA", "BET BUILDER", "ACUMULADOR DO JOGO", "MEU BILHETE", "JOGO DO SEU JEITO" → "Criar Aposta"
+      Importante: uma Dupla com marcador "APOSTA AUMENTADA" é "Super Aumentada", NÃO "Dupla". O marcador prevalece.
+   2) CONTAGEM DE SELEÇÕES (quando não há marcador de oferta especial):
+      - "Simples": 1 única seleção
+      - "Dupla": 2 seleções combinadas de JOGOS/MERCADOS DIFERENTES, odd única
+      - "Tripla": 3 seleções combinadas de jogos/mercados diferentes, odd única
+      - "Múltipla": 4+ seleções combinadas de jogos/mercados diferentes, odd única
+
+   Se houver marcador especial mas NENHUM tipo correspondente na lista cadastrada, use "Criar Aposta" como fallback.
+   Se não der pra inferir de forma alguma, null.
+
+J. CONFIANÇA: se NÃO tiver certeza de algum campo ESPECÍFICO, deixe esse campo como NULL. É melhor null do que errado — o operador confere depois.
+
+K. INDEPENDÊNCIA DOS CAMPOS (CRÍTICO): cada campo é extraído SEPARADAMENTE dos outros. Incerteza, impasse ou dificuldade em UM campo NUNCA deve fazer outros campos virarem null por tabela. Exemplos:
+   - Se a odd 33.48 está claramente visível, registre 33.48 — mesmo que você tenha dúvida sobre stake, mercado ou qualquer outro campo.
+   - Se o tipster está claro no cabeçalho, registre o tipster — mesmo que tenha dúvida sobre a data do evento.
+   - Se você conseguiu identificar o evento e o esporte, registre — mesmo que não tenha certeza do tipo de aposta.
+   NUNCA "desista" de um bilhete inteiro por causa de um campo duvidoso. Extraia TUDO que você consegue, e deixa null SÓ os campos em que você realmente não tem certeza.
+
+L. EXTRAÇÃO DE EVENTO E MERCADO DIRETO DO PRINT: quando o print mostra claramente os times e o mercado, EXTRAIA. Não deixe null por excesso de cautela.
+   - EVENTO: o print sempre mostra os times/participantes. Aceite qualquer separador: "Time A x Time B", "Time A - Time B", "Time A vs Time B", "Time A @ Time B", "Time A v Time B". Todos viram o campo evento no formato "Time A x Time B". Ex do print "Operário-PR - Fluminense" → evento: "Operário-PR x Fluminense".
+   - EVENTO EM MERCADOS DE JOGADOR (CRÍTICO): em mercados tipo "Jogador a Marcar", "Jogador a Dar Assistência", "Pontos/Rebotes/Assistências do Jogador", "Cartão do Jogador", a estrutura do print tem:
+     (i) NOME DO JOGADOR (quem) → vai pra `entrada` (ex: "Davide Zappacosta", "LeBron James 10+ Pontos")
+     (ii) MERCADO → vai pra `mercado` (ex: "Assistências", "Anytimes", "Pontos")
+     (iii) PARTIDA "Time A v Time B" → vai pra `evento` (ex: "Atalanta x Lazio", "Bayer Leverkusen x Bayern de Munique")
+     NUNCA coloque o nome do jogador no campo evento. O evento é SEMPRE os times da partida, geralmente aparecem logo abaixo do nome do jogador em fonte menor/mais sutil.
+   - EVENTO INFERÍVEL DE TABELA DE OPÇÕES: quando o print não mostra "Time A x Time B" explícito mas lista os dois times como opções de resultado (ex: tabela com colunas/linhas "Flamengo / Vitória / Empate"), extraia os dois times como evento ("Flamengo x Vitória"). A palavra "Empate" nunca é time.
+   - EVENTO TRUNCADO: quando o print mostra o nome dos times cortado ("Houston Rock...", "San Antonio Spu..."), NÃO completar por inferência. Use o texto parcial como aparece ou deixe null.
+   - ENTRADA EM TABELA CRUZADA: quando o print mostra uma matriz tipo "Sim/Não × Resultados" (ex: colunas Sim/Não e linhas Flamengo/Vitória/Empate), a entrada é LINHA + COLUNA selecionada conforme descrição do operador. Ex: "Flamengo e Não @1.90" → entrada: "Flamengo e Não".
+   - MERCADO — HIERARQUIA DE INFERÊNCIA (ver também [R5] nas regras absolutas):
+     1) RÓTULO DO MERCADO ESCRITO PELA CASA NO BILHETE (fonte primária, sempre prevalece): é o texto que a casa pinta acima/ao lado da seleção no próprio bilhete. Sempre que houver rótulo explícito, USE ele (com match semântico à lista cadastrada). Exemplos: "Jogador a Dar Assistência", "Jogador a Marcar", "Total de pontos", "Total games", "Total de Rebotes", "Total de Cartões Mais/Menos", "Resultado Final", "Resultado/Ambos Marcam", "Ambos Marcam", "Handicap Asiático", "Handicap de Rondas", "Handicap de Set", "Handicap de Games", "Handicap do Jogo", "Mais/Menos Gols", "Qualificar-se", "Partida - Vencedor - 2 Opções", "Rebotes", "Pontos", "Pontos + Rebotes", "Pontos + Rebotes + Assistências", "Match Winner 2-Way".
+     2) DESCRIÇÃO/MÉTODO DO TIPSTER (apenas confirmação): "Método: Gol", "Método: Assistência". Serve pra confirmar, nunca sobrescrever o rótulo da casa.
+     3) ASSOCIAÇÃO POR TIPSTER (último recurso): nunca classifique só porque "tipster X costuma postar Y".
+   - HANDICAP GENÉRICO EM ESPORTS: quando o print mostra apenas "Handicap" sem especificação adicional em jogos de esports (CS, LOL, DOTA, Valorant) e o valor é tipicamente -1.5/-2.5/+1.5/+2.5 (indicando mapas de vantagem em BO3/BO5), assuma "Handicap de Partida" se estiver cadastrado. Se o valor tiver contexto de "rondas" ou "mapa X", use "Handicap de Rondas" ou "Handicap de Mapas" conforme cadastro.
+   - MATCH SEMÂNTICO COM LISTA CADASTRADA: após identificar o mercado pela hierarquia acima, faça match semântico com a lista de Mercados cadastrada (pode vir em qualquer idioma — português, inglês, espanhol — e com descrições variadas conforme a casa). Use o nome EXATO do cadastro quando reconhecer a intenção.
+     * Exemplos de match semântico:
+       - Rótulo da casa "Marcar a Qualquer Momento" / "Anytime Goalscorer" / "Anytime Scorer" → mercado cadastrado "Anytimes" (se existir)
+       - Rótulo "Jogador a Dar Assistência" / "Anytime Assist" → "Assistências" (se cadastrado)
+       - Rótulo "Match Winner" / "Moneyline" / "ML" / "Resultado Final" / "Vencedor" / "Partida - Vencedor" → "Resultado Final" (se cadastrado)
+       - Rótulo "Both Teams to Score" / "BTTS" / "Ambos Marcam" → "Ambos Marcam" (se cadastrado)
+       - Rótulo "Resultado/Ambos Marcam" → "ML e Ambos Marcam" (se cadastrado)
+       - Rótulo "Over/Under Cards" / "Total de Cartões Mais/Menos" → "Cartões Mais/Menos" ou similar
+       - Rótulo "Handicap de Rondas" / "Round Handicap" / "Map Handicap" → "Handicap de Rondas" (se cadastrado)
+       - Rótulo "Total games" (tênis) → "Games" ou "Total de Games" (conforme cadastro)
+     * Se NENHUM mercado da lista corresponder semanticamente, extraia o texto como aparece no print.
+     * JAMAIS retornar "ML" literal ou null quando há rótulo explícito da casa no print — sempre tente match semântico primeiro.
+
+U. CASAS EM DÓLAR (ThunderPick, Polymarket e similares) E CASAS COM R$ E US$ (listas em CADASTROS):
+   - Marca d'água ou logo da casa no print IDENTIFICA o bookie mesmo sem a descrição citar (ex: marca d'água "THUNDERPICK" → bookie "ThunderPick").
+   - Valor apostado em USD / US$ / $ / USDT (ex: "Aposta 50,01 USD", legenda "20 usd") → preencha stake_usd: 50.01 e deixe stake_reais null. NUNCA coloque valor em dólar em stake_reais.
+   - Casa que aceita R$ e US$ (ex.: Stake): a moeda é a do VALOR, nunca a da casa. "R$" no print ou valor na legenda sem moeda ("150,00") → stake_reais; "$", "US$", "USD" ou "USDT" no print ou na legenda → stake_usd. Se legenda e print divergirem, vale a legenda.
+   - Se além do valor em dólar houver stake em unidades explícita ("1u"), preencha também stake_unidades.
+
+V. APOSTA JÁ RESOLVIDA NO PRINT:
+   - Selo de resultado visível no bilhete define o status: "Ganho"/"Won"/"Vitória" → WON; "Perdido"/"Lost"/"Derrota" → LOST; "Reembolso"/"Devolvida"/"Void"/"Anulada" → VOID; "Cash out"/"Encerrada" com valor antecipado → CASH OUT; "Meio ganho" → HALF WON; "Meia perda" → HALF LOST.
+   - Sem selo de resultado (aposta em aberto) → status null.
+
+W. DÚVIDAS (o operador lê na hora, no Telegram, e corrige):
+   - Se algum campo que você preencheu PODE ESTAR ERRADO — número borrado ou cortado, dois valores possíveis, informação que você precisou supor — escreva em "duvidas" da própria aposta: no máximo 2 itens, cada um com até 90 caracteres, começando pelo campo e dizendo o que você assumiu. Exemplos: "odd: li 1.66, pode ser 1.68" · "stake: '1' sem 'u', assumi 1u" · "casa: sem marca d'água, usei a 1ª linha da descrição" · "entrada: bilhete cortado, não vi a linha do handicap".
+   - NÃO registre dúvida sobre o que você leu com clareza, nem por falta de data no print (usar a DATA DE HOJE é o padrão). Dúvida de data só quando o print indica outro dia ("Amanhã", "Tomorrow", dia da semana, data incompleta).
+   - Sem dúvida real → "duvidas": []. Na dúvida se é dúvida, não registre.
+   - Se NÃO encontrou nenhuma aposta, explique o motivo em "duvida_geral" (até 120 caracteres; ex.: "print mostra só o saldo da conta", "imagem cortada: não aparece seleção nem odd"). Se encontrou aposta, "duvida_geral": null.
+
+FORMATO DE RESPOSTA (JSON puro, sem markdown):
+
+{{
+  "apostas": [
+    {{
+      "data_evento": "YYYY-MM-DD" ou null,
+      "evento": "ex: 1W x GenOne" ou null,
+      "esporte": "nome igual ao cadastro" ou null,
+      "mercado": "ex: Handicap de rondas, Ambos Marcam" ou null,
+      "entrada": "ex: 1W -3.5 Mapa 3, Sim, Over" ou null,
+      "odd": number ou null,
+      "stake_unidades": number ou null,
+      "stake_reais": number ou null,
+      "stake_usd": number ou null,
+      "status": "WON|LOST|VOID|HALF WON|HALF LOST|CASH OUT" ou null,
+      "tipo_aposta": "nome igual ao cadastro (Simples|Dupla|Tripla|Múltipla|Criar Aposta|Super Aumentada|outros)" ou null,
+      "tipster": "nome igual ao cadastro" ou null,
+      "operador": "nome igual ao cadastro" ou null,
+      "bookie": "nome igual ao cadastro" ou null,
+      "contas_utilizadas": "separadas por vírgula" ou null,
+      "duvidas": ["campo: o que você assumiu"] ou []
+    }}
+  ],
+  "duvida_geral": "motivo de não ter achado aposta" ou null
+}}
+
+Responda APENAS com o JSON.
+
+ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
+1. Bet builder? → Print tem "CRIAR APOSTA"/"BET BUILDER" OU sinais estruturais (múltiplas seleções do mesmo jogador/jogo + 1 odd + 1 valor APOSTAR + sem botões individuais + opcionalmente "N Seleções" em destaque)? → 1 item só, tipo "Criar Aposta", entrada concatenada. Se NÃO, não invente.
+2. Data veio de texto EXPLÍCITO do print/descrição? → Se não, use a DATA DE HOJE do contexto.
+3. Times conhecidos? → Esporte marcado (específico: NBA/WNBA/Futebol Feminino se existir).
+4. Descrição começa com bookie? → Preenchi o bookie (incluindo "365"→Bet365, "AG"→Aposta Ganha).
+5. Palavra após bookie? → Preenchi a conta. Exceto se for palavra qualitativa ("Todas", "Várias") = null mas continua extração.
+6. Rótulo da casa no bilhete? → Preenchi o mercado via match semântico respeitando especificidade exata ("Chutes" ≠ "Chutes no gol"; "Vencedor" ≠ "Vencedor do Mapa").
+7. STAKE: há "Xu", "X%", "@odd / Xu", "Stake: X" em QUALQUER parte do texto (imagem + descrição)? → Preenchi stake_unidades. Nunca null se há sinal.
+8. ODD: descrição tem "odd X.XX" (ou typos "od"/"ood")? → USEI esse valor, NÃO o do print.
+9. "BH" no cabeçalho? → tipster "BH CS" + esporte "Counter-Strike".
+10. Tipo_aposta: 1 seleção sem marcador especial = Simples. Não inventar Criar Aposta.
+11. Valor em USD/US$/$/USDT no bilhete ou na legenda, ou marca d'água de casa só em dólar? → stake_usd preenchido, stake_reais null, bookie pela marca d'água. Casa com R$ e US$: moeda pelo valor (R$ ou sem moeda → stake_reais).
+12. Selo de resultado (Ganho/Perdido/Reembolso...)? → status preenchido. Sem selo → null.
+13. Algum campo pode estar errado (leitura ambígua, valor suposto)? → "duvidas" da aposta (máx 2). Nenhuma aposta achada → "duvida_geral" com o motivo.
+"""
+
+    img_b64 = base64.b64encode(imagem_bytes).decode('ascii')
+
+    # Retry com backoff exponencial para erros transitórios da Anthropic API
+    # (529 Overloaded, 429 Rate Limit, 503 Service Unavailable, falhas de conexão)
+    backoffs = [1, 2, 4, 8]  # até 4 retries → 5 tentativas, espera total máx 15s
+    resp = None
+    for tentativa in range(len(backoffs) + 1):
+        try:
+            resp = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=2000,
+                system=[
+                    {
+                        "type": "text",
+                        "text": regras_fixas,
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                    },
+                    {
+                        "type": "text",
+                        "text": contexto_cadastros,
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                    }
+                ],
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                        {"type": "text", "text": contexto_variavel}
+                    ]
+                }]
+            )
+            if tentativa > 0:
+                print(f"  ✅ Sucesso após {tentativa} retry(s)")
+            break
+        except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
+            status = getattr(e, 'status_code', None)
+            retryable = status in (429, 529, 503) or isinstance(e, anthropic.APIConnectionError)
+            if retryable and tentativa < len(backoffs):
+                espera = backoffs[tentativa]
+                cod = status if status else 'conn'
+                print(f"  ⏳ Anthropic erro {cod} — retry #{tentativa+1}/{len(backoffs)} em {espera}s")
+                time.sleep(espera)
+                continue
+            raise
+
+    text_raw = resp.content[0].text
+
+    # Log de cache (pra acompanhar economia nos logs do Railway)
+    try:
+        u = resp.usage
+        cache_read = getattr(u, 'cache_read_input_tokens', 0) or 0
+        cache_write = getattr(u, 'cache_creation_input_tokens', 0) or 0
+        inp = getattr(u, 'input_tokens', 0) or 0
+        out = getattr(u, 'output_tokens', 0) or 0
+        status = "HIT" if cache_read > 0 else ("MISS" if cache_write > 0 else "SEM CACHE")
+        print(f"  💰 Cache: {status} | input={inp} cache_read={cache_read} cache_write={cache_write} output={out}")
+    except Exception:
+        pass
+
+    text = text_raw.strip()
+    text = re.sub(r'^```(?:json)?\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
+
+    # Proteção contra resposta vazia/não-JSON (modelo pode retornar texto explicativo)
+    if not text or not text.startswith('{'):
+        print(f"  ⚠️ Resposta do modelo não é JSON válido:")
+        print(f"     Raw: {text_raw[:500]}")
+        # Tenta extrair JSON no meio do texto (modelo pode ter prefixado com explicação)
+        match = re.search(r'\{.*"apostas".*\}', text_raw, re.DOTALL)
+        if match:
+            text = match.group(0)
+            print(f"  ✅ JSON extraído do meio da resposta")
+        else:
+            # Sem JSON → retorna estrutura vazia pra tratar como "não entendi"
+            return {'apostas': []}
+
+    try:
+        resultado = json.loads(text)
+    except json.JSONDecodeError as e:
+        print(f"  ⚠️ JSONDecodeError: {e}")
+        print(f"     Texto: {text[:500]}")
+        return {'apostas': []}
+    return reforcar_stake(client, resultado, imagem_bytes, descricao_msg)
+
+
+# ============================================================
+# REFORÇO DE STAKE — 2ª chamada curta e focada quando a extração
+# principal devolve stake nula num print de aposta única.
+# (o prompt principal é longo; uma pergunta isolada acerta muito mais)
+# ============================================================
+PROMPT_STAKE = (
+    "Esta imagem é o print de uma aposta esportiva enviada por um tipster, seguida da descrição do operador.\n"
+    "Qual a STAKE em UNIDADES indicada? Procure em QUALQUER parte da imagem (bilhete, legenda abaixo, texto do tipster) "
+    "e na descrição padrões como: \"(1u)\", \"1u\", \"0.5u\", \"@ 1.73 (1u)\", \"/ 0.75u\", \"Stake: 1\", \"2%\" (% = unidade).\n"
+    "IGNORE odds (ex: 1.735), handicaps (ex: -0.25), 'Min' de odd mínima e campos vazios de Stake/Win da interface da casa.\n"
+    "Responda APENAS com JSON: {\"stake_unidades\": numero ou null}. Use null só se não houver NENHUM número ligado a u/%/stake."
+)
+
+def extrair_stake_focado(client, imagem_bytes, descricao_msg):
+    try:
+        img_b64 = base64.b64encode(imagem_bytes).decode('ascii')
+        r = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=60,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                {"type": "text", "text": PROMPT_STAKE + f"\n\nDESCRIÇÃO DO OPERADOR: \"{descricao_msg or '(sem descrição)'}\""},
+            ]}],
+        )
+        raw = r.content[0].text.strip()
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        val = json.loads(m.group(0)).get('stake_unidades') if m else None
+        if isinstance(val, (int, float)) and 0 < val <= 50:
+            return float(val)
+    except Exception as e:
+        print(f"  ⚠️ Reforço de stake falhou: {e}", flush=True)
+    return None
+
+def reforcar_stake(client, resultado, imagem_bytes, descricao_msg):
+    aps = (resultado or {}).get('apostas') or []
+    if len(aps) == 1 and aps[0].get('stake_unidades') is None and aps[0].get('stake_reais') is None and aps[0].get('stake_usd') is None:
+        su = extrair_stake_focado(client, imagem_bytes, descricao_msg)
+        if su is not None:
+            aps[0]['stake_unidades'] = su
+            print(f"  🎯 Stake recuperada no reforço: {su}u", flush=True)
+        else:
+            print("  🎯 Reforço de stake: nenhuma stake encontrada", flush=True)
+    return resultado
+
+# ============================================================
+# BOOKIE PELA DESCRIÇÃO — fallback determinístico quando o modelo
+# devolve bookie null mesmo com a casa escrita na 1ª linha ("22bet")
+# ============================================================
+ALIASES_BOOKIE = {'365': 'bet365', 'ag': 'aposta ganha'}
+
+def bookie_da_descricao(descricao, cadastros):
+    if not descricao or not descricao.strip():
+        return None
+    nomes = {b['nome'].lower(): b['nome'] for b in cadastros['bookies']}
+    primeira = descricao.strip().splitlines()[0].strip().lower()
+    for c in [primeira] + primeira.split()[:3]:
+        c = ALIASES_BOOKIE.get(c.strip('.,;:'), c.strip('.,;:'))
+        if c in nomes:
+            return nomes[c]
+    return None
+
+# ============================================================
+# TEXTOS EXTRAS DA MENSAGEM — citação/resposta podem carregar o texto
+# do tipster (ex: "@ 1.746 (1u)") fora da imagem e fora da legenda
+# ============================================================
+def textos_extras(msg):
+    partes = []
+    q = (msg.get('quote') or {}).get('text')
+    if q: partes.append(q)
+    rt = msg.get('reply_to_message') or {}
+    t = rt.get('caption') or rt.get('text')
+    if t: partes.append(t)
+    return '\n'.join(partes)
+
+def log_estrutura(msg):
+    try:
+        p = (msg.get('photo') or [{}])[-1]
+        info = {
+            'keys': sorted(k for k in msg.keys() if k not in ('photo', 'from', 'chat')),
+            'foto': f"{p.get('width')}x{p.get('height')} {p.get('file_size')}B",
+            'quote': ((msg.get('quote') or {}).get('text') or '')[:120],
+            'reply_caption': (((msg.get('reply_to_message') or {}).get('caption')) or '')[:120],
+            'external_reply': sorted((msg.get('external_reply') or {}).keys()),
+            'forward_origin': (msg.get('forward_origin') or {}).get('type'),
+        }
+        print(f"  🔎 Estrutura: {json.dumps(info, ensure_ascii=False)}", flush=True)
+    except Exception as e:
+        print(f"  🔎 log_estrutura falhou: {e}", flush=True)
+
+# ============================================================
+# TRAVA DE DATA — aposta encaminhada hoje não pode cair no passado
+# Exceções: operador escreveu data ("24/09") ou "ontem" na descrição
+# (registro retroativo proposital) e madrugada até 06h BRT aceitando
+# o dia anterior (jogo da noite anterior ainda em andamento).
+# ============================================================
+RE_DATA_DESC = re.compile(r'\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b|\bontem\b|\banteontem\b', re.IGNORECASE)
+
+def normalizar_data_evento(data_ev, data_hoje, descricao):
+    if not data_ev or data_ev >= data_hoje:
+        return data_ev
+    if descricao and RE_DATA_DESC.search(descricao):
+        return data_ev
+    agora = datetime.now(BRT)
+    if agora.hour < 6 and data_ev == (agora - timedelta(days=1)).strftime('%Y-%m-%d'):
+        return data_ev
+    print(f"  📅 data_evento {data_ev} no passado → ajustada pra {data_hoje}", flush=True)
+    return data_hoje
+
+# ============================================================
+# CONVERTE DADOS EXTRAÍDOS → LINHA DO SUPABASE
+# ============================================================
+def find_id(arr, nome):
+    if not nome: return None
+    nome_l = nome.lower().strip()
+    # Exato
+    for x in arr:
+        if x['nome'].lower() == nome_l:
+            return x['id']
+    # Substring bidirecional (preserva comportamento anterior)
+    for x in arr:
+        if nome_l in x['nome'].lower() or x['nome'].lower() in nome_l:
+            return x['id']
+    # Match por tokens: quebra em palavras e checa interseção significativa
+    # Útil pra nomes compostos tipo "Syro & GuiaDasApostas" vs cadastro "GDA Syro"
+    STOP = {'&', 'e', '+', '-', '|', '/', 'de', 'da', 'do', 'das', 'dos', ''}
+    tokens_in = {t.strip('.,;:()[]') for t in re.split(r'[\s&|/+]+', nome_l) if t}
+    tokens_in = {t for t in tokens_in if t and t not in STOP and len(t) >= 3}
+    if not tokens_in:
+        return None
+    for x in arr:
+        tokens_x = {t.strip('.,;:()[]') for t in re.split(r'[\s&|/+]+', x['nome'].lower()) if t}
+        tokens_x = {t for t in tokens_x if t and t not in STOP and len(t) >= 3}
+        if tokens_in & tokens_x:
+            return x['id']
+    return None
+
+def get_stake_valor(tipster_id, data_evento, stakes):
+    if not tipster_id or not data_evento:
+        return None
+    cand = [s for s in stakes if s['tipster_id'] == tipster_id and s['vigente_a_partir'] <= data_evento]
+    if not cand: return None
+    cand.sort(key=lambda s: s['vigente_a_partir'], reverse=True)
+    return float(cand[0]['valor_reais'])
+
+def get_stake_valor_usd(tipster_id, data_evento, stakes_usd):
+    if not tipster_id or not data_evento:
+        return None
+    cand = [s for s in (stakes_usd or []) if s['tipster_id'] == tipster_id and s['vigente_a_partir'] <= data_evento]
+    if not cand: return None
+    cand.sort(key=lambda s: s['vigente_a_partir'], reverse=True)
+    return float(cand[0]['valor_usd'])
+
+STATUS_VALIDOS = {'WON', 'LOST', 'VOID', 'HALF WON', 'HALF LOST', 'CASH OUT'}
+
+def validar_linha(ap, linha):
+    """Checagens determinísticas pós-extração. Retorna lista de avisos.
+    Não bloqueia o insert — avisos mudam a reação no Telegram pra chamar conferência humana."""
+    # Textos vão pro log E pra resposta no Telegram: dizer o que faltou e o que fazer.
+    avisos = []
+    if ap.get('tipster') and not linha.get('tipster_id'):
+        avisos.append(f"tipster '{ap.get('tipster')}' não está no cadastro — ficou sem tipster")
+    elif not linha.get('tipster_id'):
+        avisos.append("não identifiquei o tipster")
+    if ap.get('bookie') and not linha.get('bookie_id'):
+        avisos.append(f"casa '{ap.get('bookie')}' não está no cadastro — ficou sem casa")
+    elif not linha.get('bookie_id'):
+        avisos.append("não identifiquei a casa (sem marca d'água nem nome na legenda)")
+    su = linha.get('stake_unidades')
+    sr = linha.get('stake_reais')
+    if su is None and sr is None and linha.get('stake_usd') is None:
+        avisos.append("sem stake: não achei unidade nem valor no print/legenda")
+    if linha.get('moeda') == 'USD' and linha.get('stake_usd') is not None and su is None:
+        avisos.append("aposta em US$ e o tipster não tem valor da unidade em US$ cadastrado — unidades em branco")
+    if su is not None and float(su) > 3:
+        avisos.append(f"stake alta ({fmt_num(su)}u) — confere")
+    odd = linha.get('odd')
+    if odd is None:
+        avisos.append("sem odd")
+    elif float(odd) < 1.01:
+        avisos.append(f"odd inválida ({odd})")
+    if not linha.get('evento') and not linha.get('entrada'):
+        avisos.append("não li o evento nem a entrada")
+    return avisos
+
+# ============================================================
+# RESPOSTA NO TELEGRAM — o bot responde o próprio print quando algo
+# não foi registrado, ficou faltando ou ele teve dúvida. Print ok = só 🔥.
+# ============================================================
+def fmt_num(v):
+    """1.0 → '1' · 0.75 → '0,75' · 40.0 → '40'"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    s = f"{f:.2f}".rstrip('0').rstrip('.')
+    return s.replace('.', ',')
+
+def resumo_aposta(linha, cadastros):
+    """'Rooster +1.5 mapas @1.66 · ThunderPick · 0,8u' — o suficiente pra achar a aposta."""
+    casa = next((b['nome'] for b in cadastros['bookies'] if b['id'] == linha.get('bookie_id')), None)
+    ent = (linha.get('entrada') or linha.get('evento') or '?').strip()
+    if len(ent) > 48:
+        ent = ent[:47] + '…'
+    partes = [ent + (f" @{linha['odd']}" if linha.get('odd') else '')]
+    if casa:
+        partes.append(casa)
+    su, sd, sr = linha.get('stake_unidades'), linha.get('stake_usd'), linha.get('stake_reais')
+    if su is not None:
+        partes.append(f"{fmt_num(su)}u")
+    elif sd is not None:
+        partes.append(f"US$ {fmt_num(sd)}")
+    elif sr is not None:
+        partes.append(f"R$ {fmt_num(sr)}")
+    return ' · '.join(partes)
+
+def limpar_duvidas(lista):
+    out = []
+    for d in (lista or []):
+        if isinstance(d, str) and d.strip():
+            d = d.strip()
+            out.append(d if len(d) <= 100 else d[:99] + '…')
+    return out[:2]
+
+def novo_relatorio():
+    # itens: apostas gravadas {'resumo','avisos','duvidas'} · falhas: não gravadas {'resumo','erro'}
+    return {'itens': [], 'falhas': [], 'duvida_geral': None}
+
+def texto_resposta(orig_id, rel, correcao=False):
+    """Texto da resposta no Telegram, ou None quando não há nada a dizer (print ok)."""
+    itens, falhas = rel['itens'], rel['falhas']
+    dica = "↩️ Pra corrigir, responda esta mensagem com: corrigir: <o que mudar> · se estiver certo, responda: ok"
+
+    if not itens and not falhas:
+        cab = (f"🤔 #{orig_id} · mesmo com a correção não achei aposta nesse print — nada foi alterado."
+               if correcao else f"🤔 #{orig_id} · não achei aposta nesse print.")
+        linhas = [cab]
+        if rel.get('duvida_geral'):
+            linhas.append(f"💭 {rel['duvida_geral']}")
+        linhas += ["", "↩️ Se for aposta, responda esta mensagem com: corrigir: casa, entrada, odd, stake"]
+        return '\n'.join(linhas)
+
+    com_problema = [i for i in itens if i['avisos'] or i['duvidas']]
+    if not com_problema and not falhas:
+        if not correcao:
+            return None
+        n = len(itens)
+        return '\n'.join([f"✅ #{orig_id} · corrigido, {n} aposta{'s' if n != 1 else ''}:"]
+                         + [f"• {i['resumo']}" for i in itens])
+
+    n = len(itens)
+    if falhas:
+        cab = f"🤨 #{orig_id} · registrei {n} de {n + len(falhas)}, confere:"
+    elif correcao:
+        cab = f"🤨 #{orig_id} · correção aplicada ({n} aposta{'s' if n != 1 else ''}), ainda confere:"
+    else:
+        cab = f"🤨 #{orig_id} · registrei {n} aposta{'s' if n != 1 else ''}, confere:"
+    linhas = [cab]
+    for i in com_problema:
+        linhas.append(f"• {i['resumo']}")
+        linhas += [f"   ⚠️ {a}" for a in i['avisos']]
+        linhas += [f"   💭 {d}" for d in i['duvidas']]
+    for f in falhas:
+        linhas.append(f"• {f['resumo']}")
+        linhas.append(f"   ❌ não foi registrada: {f['erro']}")
+    n_ok = n - len(com_problema)
+    if n_ok:
+        linhas.append(f"(as outras {n_ok} ficaram ok)" if n_ok > 1 else "(a outra ficou ok)")
+    linhas += ["", dica]
+    return '\n'.join(linhas)
+
+def tg_reply(reply_to_id, texto):
+    """Responde no grupo citando a mensagem (quem mandou é notificado). Texto puro, sem parse_mode.
+    Devolve o message_id da resposta (ou None)."""
+    if not texto:
+        return None
+    params = dict(chat_id=CHAT_ID, text=texto[:4000], link_preview_options={'is_disabled': True})
+    if reply_to_id:
+        params['reply_parameters'] = {'message_id': reply_to_id, 'allow_sending_without_reply': True}
+    for tentativa in range(2):
+        try:
+            r = tg_call('sendMessage', **params)
+        except Exception as e:
+            print(f"  ⚠️ sendMessage erro: {e}", flush=True)
+            return None
+        if r.get('ok'):
+            return r['result']['message_id']
+        espera = (r.get('parameters') or {}).get('retry_after')
+        if r.get('error_code') == 429 and espera and tentativa == 0:
+            time.sleep(min(int(espera), 15))
+            continue
+        print(f"  ⚠️ sendMessage falhou: {r.get('description')}", flush=True)
+        return None
+    return None
+
+# ============================================================
+# LOG DE PRINTS (tabela prints_log) — 1 linha por print recebido
+# ============================================================
+def sb_upsert(table, body, on_conflict):
+    h = sb_headers()
+    h['Prefer'] = 'resolution=merge-duplicates,return=minimal'
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/{table}?on_conflict={on_conflict}",
+                      headers=h, json=body, timeout=30)
+    if not r.ok:
+        print(f"sb_upsert erro: {r.status_code} {r.text}")
+    r.raise_for_status()
+
+def log_print(dados):
+    """Nunca derruba o processamento: log é best-effort."""
+    try:
+        sb_upsert('prints_log', dados, 'tg_msg_id')
+    except Exception as e:
+        print(f"  ⚠️ prints_log: {e}", flush=True)
+
+def avisos_do_relatorio(rel):
+    out = []
+    for i in rel['itens']:
+        out += i['avisos'] + [f"dúvida — {d}" for d in i['duvidas']]
+    out += [f"não registrada: {f['erro']}" for f in rel['falhas']]
+    if rel.get('duvida_geral'):
+        out.append(f"sem aposta — {rel['duvida_geral']}")
+    return out
+
+def resultado_do_relatorio(rel):
+    if not rel['itens'] and not rel['falhas']:
+        return 'sem_aposta'
+    if not rel['itens']:
+        return 'erro'
+    if rel['falhas'] or any(i['avisos'] or i['duvidas'] for i in rel['itens']):
+        return 'aviso'
+    return 'ok'
+
+def iso_epoch(ts):
+    try:
+        return datetime.fromtimestamp(int(ts), timezone.utc).isoformat()
+    except Exception:
+        return None
+
+def _norm_caption(s):
+    return re.sub(r'\s+', ' ', (s or '').strip().lower())
+
+def print_repetido(operador, caption, foto):
+    """Mesmo operador mandou a mesma imagem com a mesma legenda nos últimos 10 min e ela já virou aposta?
+    Devolve o tg_msg_id do original (ou None). Reenvio de print que deu erro/🤔 não conta como repetido."""
+    try:
+        desde = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        rows = sb_get("prints_log?select=tg_msg_id,caption,file_unique_id,foto_w,foto_h,foto_bytes"
+                      f"&operador=eq.{requests.utils.quote(operador or '')}"
+                      f"&recebido_em=gte.{requests.utils.quote(desde)}"
+                      "&n_apostas=gt.0&order=recebido_em.desc&limit=20")
+    except Exception as e:
+        print(f"  ⚠️ checagem de repetido falhou: {e}", flush=True)
+        return None
+    cap = _norm_caption(caption)
+    for r in rows:
+        if _norm_caption(r.get('caption')) != cap:
+            continue
+        mesma_foto = (foto.get('file_unique_id') and r.get('file_unique_id') == foto.get('file_unique_id')) or (
+            foto.get('file_size') and r.get('foto_bytes') == foto.get('file_size')
+            and r.get('foto_w') == foto.get('width') and r.get('foto_h') == foto.get('height'))
+        if mesma_foto:
+            return r['tg_msg_id']
+    return None
+
+def print_original_da_resposta(resposta_bot):
+    """Operador respondeu a MENSAGEM DO BOT (não o print): acha o print pelo '#123' do texto
+    e monta um 'reply' equivalente ao print original pra correção."""
+    m = re.search(r'#(\d+)', resposta_bot.get('text') or '')
+    if not m:
+        return None
+    orig_id = int(m.group(1))
+    try:
+        rows = sb_get(f"prints_log?tg_msg_id=eq.{orig_id}&select=*")
+    except Exception as e:
+        print(f"  ⚠️ prints_log (busca do original): {e}", flush=True)
+        return None
+    if not rows or not rows[0].get('file_id'):
+        return None
+    r = rows[0]
+    try:
+        date = int(datetime.fromisoformat(r['msg_date']).timestamp()) if r.get('msg_date') else 0
+    except Exception:
+        date = 0
+    return {'message_id': orig_id, 'photo': [{'file_id': r['file_id']}], 'caption': r.get('caption') or '',
+            'date': date, 'from': {'first_name': r.get('from_nome') or ''}}
+
+def montar_linha(ap, cadastros, tg_msg_id=None):
+    """Converte um item do JSON extraído numa linha do Supabase."""
+    tipster_id  = find_id(cadastros['tipsters'], ap.get('tipster'))
+    bookie_id   = find_id(cadastros['bookies'], ap.get('bookie'))
+    operador_id = find_id(cadastros['operadores'], ap.get('operador'))
+    esporte_id  = find_id(cadastros['esportes'], ap.get('esporte'))
+
+    su = ap.get('stake_unidades')
+    sr = ap.get('stake_reais')
+    su_usd = ap.get('stake_usd')
+    data_ev = ap.get('data_evento')
+
+    # Moeda: valor em dólar no print OU casa só em dólar no cadastro.
+    # Casa que aceita as duas (AMBAS, ex.: Stake): vale o valor lido — sem valor em dólar, fica em R$.
+    moeda_casa = next((b.get('moeda') for b in cadastros['bookies'] if b['id'] == bookie_id), 'BRL') if bookie_id else 'BRL'
+    moeda = 'USD' if (su_usd or moeda_casa == 'USD') else 'BRL'
+
+    if moeda == 'USD':
+        if not su_usd and sr:          # modelo pôs o valor em dólar no campo de reais
+            su_usd, sr = sr, None
+        sr = None
+        svu = get_stake_valor_usd(tipster_id, data_ev, cadastros.get('stakes_usd'))
+        if svu:
+            if su_usd and not su:
+                su = round(su_usd / svu, 4)
+            elif su and not su_usd:
+                su_usd = round(su * svu, 2)
+    # Conversão bidirecional em R$: se tem uma ponta + valor da unidade, calcula a outra
+    elif tipster_id and data_ev:
+        sv = get_stake_valor(tipster_id, data_ev, cadastros['stakes'])
+        if sv:
+            if su and not sr:
+                sr = su * sv
+            elif sr and not su:
+                su = round(sr / sv, 2)
+
+    status = (ap.get('status') or '').upper().strip()
+    status = status if status in STATUS_VALIDOS else 'PENDING'
+
+    linha = {
+        'data_evento': data_ev,
+        'evento': ap.get('evento'),
+        'esporte_id': esporte_id,
+        'mercado': ap.get('mercado'),
+        'entrada': ap.get('entrada'),
+        'odd': ap.get('odd'),
+        'stake_unidades': su,
+        'stake_reais': sr,
+        'stake_usd': su_usd,
+        'moeda': moeda,
+        'tipo_aposta': ap.get('tipo_aposta'),
+        'tipster_id': tipster_id,
+        'operador_id': operador_id,
+        'bookie_id': bookie_id,
+        'contas_utilizadas': ap.get('contas_utilizadas'),
+        'status': status,
+        'tg_msg_id': tg_msg_id,
+    }
+    return {k: v for k, v in linha.items() if v is not None}
+
+# ============================================================
+# PROCESSAMENTO DE UMA MENSAGEM
+# ============================================================
+# Correções por reply só valem pra prints registrados a partir desta data
+# (antes disso as apostas não têm tg_msg_id — substituir viraria duplicata).
+CORRECAO_DESDE_TS = 1785283200  # 2026-07-28 00:00 UTC
+
+GATILHOS_CORRECAO = ('corrigir', 'correção', 'correcao', 'corrige', 'fix')
+GATILHOS_OK = {'ok', 'okay', 'certo', 'ta certo', 'tá certo', 'correto', 'confere', 'conferido', 'conferi',
+               'isso', 'perfeito', 'beleza', 'blz', '👍', '👌', '✅'}
+
+def eh_conferencia(texto):
+    """Resposta curta de "está certo" ao aviso do bot (a mensagem inteira, não "ok mas corrige a odd")."""
+    t = re.sub(r'[\s!.,]+$', '', (texto or '').strip().lower())
+    return t in GATILHOS_OK or t.startswith('👍')
+
+def processar_conferencia(msg, reply):
+    """'ok' respondendo o aviso do bot (ou o próprio print): o operador conferiu e está certo.
+    Marca o print como conferido — sai das pendências — sem mexer nas apostas."""
+    msg_id = msg['message_id']
+    orig_id = None
+    if reply.get('photo'):
+        orig_id = reply.get('message_id')
+    elif (reply.get('from') or {}).get('is_bot'):
+        m = re.search(r'#(\d+)', reply.get('text') or '')
+        orig_id = int(m.group(1)) if m else None
+    if not orig_id:
+        return
+    try:
+        rows = sb_get(f"prints_log?tg_msg_id=eq.{orig_id}&select=tg_msg_id,resultado,corrigido_em,conferido_em")
+    except Exception as e:
+        print(f"  ⚠️ prints_log (conferência): {e}", flush=True)
+        return
+    if not rows or rows[0].get('resultado') != 'aviso':
+        return
+    quem = operador_do_from(msg.get('from'))[1]
+    if not (rows[0].get('conferido_em') or rows[0].get('corrigido_em')):
+        try:
+            sb_patch('prints_log', f"tg_msg_id=eq.{orig_id}",
+                     {'conferido_em': datetime.now(timezone.utc).isoformat(), 'conferido_por': quem})
+        except Exception as e:
+            print(f"  ⚠️ conferência #{orig_id}: {e}", flush=True)
+            return
+        print(f"\n👌 #{orig_id} conferido por {quem}", flush=True)
+    tg_react(msg_id, '👌')
+
+def operador_do_from(from_user):
+    """Nome de quem enviou → operador, pela INICIAL do first_name (S = Samuel, A = Amaral, D = Diego)."""
+    from_user = from_user or {}
+    fname = (from_user.get('first_name') or from_user.get('username') or '').strip()
+    inicial = fname[:1].upper() if fname else ''
+    return fname, {'S': 'Samuel', 'A': 'Amaral', 'D': 'Diego'}.get(inicial, fname)
+
+def _fmt_data_br(s):
+    return f"{s[8:10]}/{s[5:7]}" if s and len(s) >= 10 else (s or '?')
+
+def _erro_curto(e):
+    return (str(e).split(' for url')[0].strip() or e.__class__.__name__)[:80]
+
+def registrar_apostas(resultado, tg_msg_id, cadastros, data_hoje, texto_data, texto_bookie, criado_por=None):
+    """Grava as apostas extraídas e devolve o relatório: o que entrou (com avisos/dúvidas) e o que falhou.
+    criado_por = quem mandou o print (base da produtividade de cada um)."""
+    rel = novo_relatorio()
+    apostas = (resultado or {}).get('apostas') or []
+    if not apostas:
+        dg = (resultado or {}).get('duvida_geral')
+        rel['duvida_geral'] = dg.strip()[:140] if isinstance(dg, str) and dg.strip() else None
+        return rel
+    for ap in apostas:
+        duvidas = limpar_duvidas(ap.get('duvidas'))
+        try:
+            ap['data_evento'] = ap.get('data_evento') or data_hoje
+            if (ap.get('status') or '').upper() not in STATUS_VALIDOS:
+                antes = ap['data_evento']
+                ap['data_evento'] = normalizar_data_evento(antes, data_hoje, texto_data)
+                if ap['data_evento'] != antes:
+                    duvidas.append(f"data: o print dizia {_fmt_data_br(antes)}, registrei hoje ({_fmt_data_br(data_hoje)})")
+            if not ap.get('bookie'):
+                ap['bookie'] = bookie_da_descricao(texto_bookie, cadastros)
+                if ap['bookie']:
+                    print(f"  🏦 Bookie pela descrição: {ap['bookie']}", flush=True)
+            linha = montar_linha(ap, cadastros, tg_msg_id=tg_msg_id)
+            if not linha.get('data_evento'):
+                linha['data_evento'] = data_hoje
+            if criado_por:
+                linha['criado_por'] = criado_por
+            casa = next((b for b in cadastros['bookies'] if b['id'] == linha.get('bookie_id')), None)
+            if casa and casa.get('moeda') == 'AMBAS' and ap.get('stake_usd') is None and ap.get('stake_reais') is None:
+                duvidas.append(f"moeda: {casa['nome']} aceita R$ e US$ e não vi valor no print — registrei em R$")
+            avisos = validar_linha(ap, linha)
+            for a in avisos:
+                print(f"  ⚠️ Aviso: {a}")
+            for d in duvidas:
+                print(f"  💭 Dúvida: {d}")
+            sb_insert('apostas', linha)
+            rel['itens'].append({'resumo': resumo_aposta(linha, cadastros), 'avisos': avisos, 'duvidas': duvidas})
+        except Exception as e:
+            print(f"  ❌ Erro salvando aposta: {e}")
+            traceback.print_exc()
+            ent = (ap.get('entrada') or ap.get('evento') or '?')[:48]
+            rel['falhas'].append({'resumo': ent + (f" @{ap['odd']}" if ap.get('odd') else ''), 'erro': _erro_curto(e)})
+    return rel
+
+def reagir_pelo_relatorio(msg_id, rel):
+    res = resultado_do_relatorio(rel)
+    tg_react(msg_id, {'ok': '🔥', 'aviso': '🤨', 'sem_aposta': '🤔', 'erro': '💩'}[res])
+    return res
+
+def processar_correcao(msg, reply, cadastros):
+    """Reprocessa um print a partir de um reply 'corrigir: ...' e SUBSTITUI
+    as apostas que aquele print gerou. Trava: só substitui se todas ainda
+    estiverem PENDING. Prints anteriores à feature não são corrigíveis.
+    O resultado volta como resposta à mensagem de correção."""
+    msg_id = msg['message_id']
+    orig_id = reply['message_id']
+    correcao = re.sub(r'^\s*(corrigir|correção|correcao|corrige|fix)\s*[:\-—]?\s*', '',
+                      (msg.get('text') or ''), flags=re.IGNORECASE)
+    quem = operador_do_from(msg.get('from'))[1]
+
+    print(f"\n✏️ Correção da msg #{orig_id} via #{msg_id} ({quem}): '{correcao[:80]}'")
+    tg_react(msg_id, '👀')
+
+    try:
+        if (reply.get('date') or 0) < CORRECAO_DESDE_TS:
+            print("  ⚠️ Print anterior à feature de correção — sem vínculo confiável, abortando")
+            tg_react(msg_id, '🤔')
+            tg_reply(msg_id, f"🤔 #{orig_id} · esse print é de antes de 28/07 e não tem vínculo com as apostas — corrige direto no dash.")
+            return
+
+        existentes = sb_get(f"apostas?tg_msg_id=eq.{orig_id}&select=id,status")
+        resolvidas = [a for a in existentes if a.get('status') != 'PENDING']
+        if resolvidas:
+            print(f"  ⚠️ {len(resolvidas)} aposta(s) desse print já resolvidas — correção manual necessária")
+            tg_react(msg_id, '🤔')
+            tg_reply(msg_id, f"🤔 #{orig_id} · {len(resolvidas)} aposta(s) desse print já foram resolvidas, então não substituo por aqui — corrige no dash.")
+            return
+
+        # Reprocessa o print original com legenda original + correção
+        file_id = reply['photo'][-1]['file_id']
+        img_bytes = tg_get_file_bytes(file_id)
+        if not img_bytes:
+            tg_react(msg_id, '💩')
+            tg_reply(msg_id, f"💩 #{orig_id} · não consegui baixar o print original do Telegram — corrige no dash.")
+            return
+
+        data_hoje = datetime.now(BRT).strftime('%Y-%m-%d')
+        _, operador_nome = operador_do_from(reply.get('from'))
+
+        caption_orig = reply.get('caption') or ''
+        descricao = (caption_orig + "\n\nCORREÇÃO DO OPERADOR (prevalece sobre tudo acima e sobre o print): "
+                     + correcao).strip()
+
+        resultado = extrair_aposta(img_bytes, descricao, cadastros, data_hoje, operador_nome)
+        if not resultado.get('apostas'):
+            print("  ⚠️ Nenhuma aposta na re-extração — nada substituído")
+            tg_react(msg_id, '🤔')
+            rel = registrar_apostas(resultado, orig_id, cadastros, data_hoje, descricao, '', criado_por=operador_nome)
+            tg_reply(msg_id, texto_resposta(orig_id, rel, correcao=True))
+            return
+
+        # Substitui: remove as antigas do print e insere as novas com o mesmo vínculo
+        if existentes:
+            sb_delete('apostas', f"tg_msg_id=eq.{orig_id}&status=eq.PENDING")
+            print(f"  🔄 {len(existentes)} aposta(s) antigas removidas")
+
+        rel = registrar_apostas(resultado, orig_id, cadastros, data_hoje, descricao,
+                                descricao.split('CORREÇÃO DO OPERADOR')[-1], criado_por=operador_nome)
+        res = reagir_pelo_relatorio(msg_id, rel)
+        print(f"  ✏️ Correção: {len(rel['itens'])} registrada(s), {len(rel['falhas'])} falha(s) → {res}")
+        tg_reply(msg_id, texto_resposta(orig_id, rel, correcao=True))
+        log_print({'tg_msg_id': orig_id, 'resultado': res, 'n_apostas': len(rel['itens']),
+                   'avisos': avisos_do_relatorio(rel),
+                   'corrigido_em': datetime.now(timezone.utc).isoformat(), 'corrigido_por': quem})
+
+    except Exception as e:
+        print(f"  ❌ Exception na correção: {e}")
+        traceback.print_exc()
+        tg_react(msg_id, '💩')
+        tg_reply(msg_id, f"💩 #{orig_id} · deu erro na correção ({_erro_curto(e)}) — tenta de novo ou corrige no dash.")
+
+def processar_mensagem(msg, cadastros):
+    msg_id = msg['message_id']
+    foto = msg.get('photo')
+    texto = msg.get('caption') or msg.get('text') or ''
+
+    if not foto:
+        # Registro de horas: "entrada", "saida", "horas" (com ou sem barra)
+        cmd = comando_horas(texto)
+        if cmd:
+            processar_horas(msg, cmd, cadastros)
+            return
+        reply = msg.get('reply_to_message')
+        # Conferência: "ok" respondendo o aviso do bot (ou o print) → marca como conferido
+        if reply and eh_conferencia(texto):
+            processar_conferencia(msg, reply)
+            return
+        # Correção: texto começando com "corrigir" respondendo o PRINT ou a MENSAGEM DO BOT sobre ele
+        if not (reply and texto and texto.strip().lower().startswith(GATILHOS_CORRECAO)):
+            return  # não é print nem correção, ignora
+        if reply.get('photo'):
+            processar_correcao(msg, reply, cadastros)
+        elif (reply.get('from') or {}).get('is_bot'):
+            orig = print_original_da_resposta(reply)
+            if orig:
+                processar_correcao(msg, orig, cadastros)
+            else:
+                tg_react(msg_id, '🤔')
+                tg_reply(msg_id, "🤔 Não achei o print dessa mensagem. Responde direto no print com: corrigir: ...")
+        return
+
+    p = foto[-1]  # maior resolução
+    file_id = p['file_id']
+    fname, operador_nome = operador_do_from(msg.get('from'))
+    base_log = {
+        'tg_msg_id': msg_id, 'chat_id': CHAT_ID, 'operador': operador_nome, 'from_nome': fname,
+        'msg_date': iso_epoch(msg.get('date')), 'caption': texto, 'file_id': file_id,
+        'file_unique_id': p.get('file_unique_id'), 'foto_w': p.get('width'), 'foto_h': p.get('height'),
+        'foto_bytes': p.get('file_size'),
+    }
+
+    print(f"\n📸 Processando msg #{msg_id}: '{texto[:80]}'")
+    log_estrutura(msg)
+    print(f"  👤 from='{fname}' → operador='{operador_nome}'")
+
+    # Mesmo operador, mesma imagem e legenda há poucos minutos, e o primeiro já virou aposta → não duplica
+    dup = print_repetido(operador_nome, texto, p)
+    if dup:
+        print(f"  🔁 Repetido do #{dup} — não registrado")
+        tg_react(msg_id, '🤔')
+        rid = tg_reply(msg_id, f"🔁 #{msg_id} · parece repetido do #{dup} (mesma imagem e legenda, enviado há pouco) — não registrei de novo.\n\n↩️ Se era outra aposta, responda esta mensagem com: corrigir: registrar")
+        log_print({**base_log, 'resultado': 'duplicado', 'n_apostas': 0,
+                   'avisos': [f"repetido do #{dup}"], 'resposta_msg_id': rid})
+        return
+
+    extras = textos_extras(msg)
+    texto_modelo = texto + (f"\n\nTEXTO ORIGINAL DO TIPSTER (mensagem citada/encaminhada): {extras}" if extras else '')
+
+    # Marca como processando
+    tg_react(msg_id, '👀')
+
+    try:
+        img_bytes = tg_get_file_bytes(file_id)
+        if not img_bytes:
+            tg_react(msg_id, '💩')
+            rid = tg_reply(msg_id, f"💩 #{msg_id} · não consegui baixar a imagem do Telegram. Manda o print de novo.")
+            log_print({**base_log, 'resultado': 'erro', 'avisos': ['falha ao baixar a imagem'], 'resposta_msg_id': rid})
+            return
+
+        data_hoje = datetime.now(BRT).strftime('%Y-%m-%d')
+        resultado = extrair_aposta(img_bytes, texto_modelo, cadastros, data_hoje, operador_nome)
+        rel = registrar_apostas(resultado, msg_id, cadastros, data_hoje, texto, texto, criado_por=operador_nome)
+
+        res = reagir_pelo_relatorio(msg_id, rel)
+        n = len(rel['itens'])
+        print({'ok': f"  ✅ {n} aposta(s) registrada(s)",
+               'aviso': f"  ⚠️ {n} registrada(s), {len(rel['falhas'])} falha(s) — conferir",
+               'sem_aposta': "  ⚠️ Nenhuma aposta detectada",
+               'erro': "  ❌ Nenhuma aposta salva"}[res])
+        rid = tg_reply(msg_id, texto_resposta(msg_id, rel))
+        if rid:
+            print(f"  💬 Respondido no Telegram (#{rid})")
+        log_print({**base_log, 'resultado': res, 'n_apostas': n,
+                   'avisos': avisos_do_relatorio(rel), 'resposta_msg_id': rid})
+        aviso_sem_entrada(msg_id, operador_nome, cadastros)
+
+    except Exception as e:
+        print(f"  ❌ Exception: {e}")
+        traceback.print_exc()
+        tg_react(msg_id, '💩')
+        rid = tg_reply(msg_id, f"💩 #{msg_id} · deu erro ao processar ({_erro_curto(e)}). Manda o print de novo ou registra no dash.")
+        log_print({**base_log, 'resultado': 'erro', 'avisos': [f"erro: {_erro_curto(e)}"], 'resposta_msg_id': rid})
+
+# ============================================================
+# REGISTRO DE HORAS — "entrada", "saida" e "horas" no Planilhar.
+# Horas registradas × valor da hora = base da nota de cada operador.
+# ============================================================
+def sb_patch(table, where, body):
+    r = requests.patch(f"{SUPABASE_URL}/rest/v1/{table}?{where}", headers=sb_headers(), json=body, timeout=30)
+    if not r.ok:
+        print(f"sb_patch erro: {r.status_code} {r.text}")
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+def sb_rpc(fn, params):
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/{fn}", headers=sb_headers(), json=params, timeout=30)
+    if not r.ok:
+        print(f"sb_rpc erro: {r.status_code} {r.text}")
+    r.raise_for_status()
+    return r.json()
+
+def comando_horas(texto):
+    t = re.sub(r'@\w+$', '', (texto or '').strip().lower()).strip().lstrip('/').strip()
+    return {'entrada': 'entrada', 'saida': 'saida', 'saída': 'saida', 'horas': 'horas'}.get(t)
+
+def _ts(s):
+    return datetime.fromisoformat(s.replace('Z', '+00:00')) if isinstance(s, str) else s
+
+def _utc_q(dt):
+    """Timestamp pro filtro do PostgREST (sem '+', que quebraria a URL)."""
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+def fmt_hm(dt):
+    return dt.astimezone(BRT).strftime('%H:%M')
+
+def fmt_dur(horas):
+    m = int(round(float(horas or 0) * 60))
+    return f"{m // 60}h{m % 60:02d}"
+
+def fmt_brl(v):
+    s = f"{float(v or 0):,.2f}"
+    return 'R$ ' + s.replace(',', 'X').replace('.', ',').replace('X', '.')
+
+def semana_de(data_iso):
+    d = datetime.strptime(data_iso, '%Y-%m-%d')
+    seg = d - timedelta(days=d.weekday())
+    return seg.strftime('%Y-%m-%d'), (seg + timedelta(days=6)).strftime('%Y-%m-%d')
+
+def mes_de(data_iso):
+    d = datetime.strptime(data_iso, '%Y-%m-%d')
+    prox = (d.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return d.replace(day=1).strftime('%Y-%m-%d'), (prox - timedelta(days=1)).strftime('%Y-%m-%d')
+
+def operador_da_msg(msg, cadastros):
+    """Operador pela inicial do nome no Telegram (mesma regra dos prints); guarda o id do Telegram."""
+    _, nome = operador_do_from(msg.get('from'))
+    op = next((o for o in cadastros['operadores'] if o['nome'] == nome), None)
+    uid = (msg.get('from') or {}).get('id')
+    if op and uid and op.get('tg_user_id') != uid:
+        try:
+            sb_patch('operadores', f"id=eq.{op['id']}", {'tg_user_id': uid})
+            op['tg_user_id'] = uid
+        except Exception as e:
+            print(f"  ⚠️ tg_user_id: {e}", flush=True)
+    return op
+
+def remunerado_por_hora(op_id, cadastros, data_iso=None):
+    data_iso = data_iso or datetime.now(BRT).strftime('%Y-%m-%d')
+    cand = sorted([r for r in cadastros.get('remuneracao', [])
+                   if r['operador_id'] == op_id and r['vigente_a_partir'] <= data_iso],
+                  key=lambda r: r['vigente_a_partir'], reverse=True)
+    return bool(cand) and float(cand[0].get('valor_hora') or 0) > 0
+
+def registro_aberto(op_id):
+    rows = sb_get(f"registro_horas?operador_id=eq.{op_id}&fim=is.null&select=id,inicio,tg_msg_inicio&limit=1")
+    return rows[0] if rows else None
+
+def escala_do_dia(op_id, data_iso):
+    rows = sb_get(f"escala?operador_id=eq.{op_id}&data=eq.{data_iso}&select=janela_inicio,janela_fim,horas_previstas&limit=1")
+    return rows[0] if rows else None
+
+def painel_do_operador(nome, de, ate):
+    try:
+        d = sb_rpc('painel_operadores', {'p_de': de, 'p_ate': ate})
+    except Exception as e:
+        print(f"  ⚠️ painel_operadores: {e}", flush=True)
+        return None
+    return next((o for o in (d or {}).get('operadores', []) if o.get('nome') == nome), None)
+
+def linhas_pendencias(p):
+    out = []
+    if p and p.get('pend_prints'):
+        n = p['pend_prints']
+        ids = ', '.join(f"#{i}" for i in (p.get('pend_prints_ids') or [])[:5]) + ('…' if n > 5 else '')
+        out.append(f"• {n} print{'s' if n != 1 else ''} com aviso sem correção ({ids})")
+    if p and p.get('penduradas'):
+        n = p['penduradas']
+        out.append(f"• {n} aposta{'s' if n != 1 else ''} com evento já encerrado pra resolver no dash")
+    return out
+
+def processar_horas(msg, cmd, cadastros):
+    msg_id = msg['message_id']
+    op = operador_da_msg(msg, cadastros)
+    if not op:
+        tg_reply(msg_id, "⏱️ Não achei você no cadastro de operadores.")
+        return
+    nome = op['nome']
+    quando = datetime.fromtimestamp(msg.get('date') or time.time(), timezone.utc)
+    hoje = quando.astimezone(BRT).strftime('%Y-%m-%d')
+    print(f"\n⏱️ {cmd} · {nome} · {fmt_hm(quando)}", flush=True)
+    try:
+        aberto = registro_aberto(op['id'])
+        if cmd == 'entrada':
+            if aberto:
+                ini = _ts(aberto['inicio'])
+                tg_reply(msg_id, f"⏱️ {nome} · você já está com entrada aberta desde {fmt_hm(ini)} "
+                                 f"({fmt_dur((quando - ini).total_seconds() / 3600)}).")
+                return
+            sb_insert('registro_horas', {'operador_id': op['id'], 'inicio': quando.isoformat(),
+                                         'origem': 'telegram', 'tg_msg_inicio': msg_id})
+            linhas = [f"⏱️ {nome} · entrada {fmt_hm(quando)}."]
+            esc = escala_do_dia(op['id'], hoje)
+            if esc:
+                linhas.append(f"Escala de hoje: {esc['janela_inicio'][:5]}–{esc['janela_fim'][:5]}, "
+                              f"{fmt_dur(esc['horas_previstas'])} previstas.")
+            elif remunerado_por_hora(op['id'], cadastros, hoje):
+                linhas.append("Hoje você não está na escala.")
+            linhas.append("Antes de começar, confere os saldos das casas principais.")
+            pend = linhas_pendencias(painel_do_operador(nome, hoje, hoje))
+            if pend:
+                linhas += ["", "Pendente de antes:"] + pend
+            tg_reply(msg_id, '\n'.join(linhas))
+
+        elif cmd == 'saida':
+            if not aberto:
+                tg_reply(msg_id, f"⏱️ {nome} · não achei entrada aberta. Se esqueceu de marcar, "
+                                 f"avisa o Samuel que ele ajusta no painel.")
+                return
+            ini = _ts(aberto['inicio'])
+            fim = max(quando, ini)
+            sb_patch('registro_horas', f"id=eq.{aberto['id']}", {'fim': fim.isoformat(), 'tg_msg_fim': msg_id})
+            seg, dom = semana_de(hoje)
+            p = painel_do_operador(nome, seg, dom)
+            linhas = [f"⏱️ {nome} · saída {fmt_hm(fim)} · {fmt_dur((fim - ini).total_seconds() / 3600)} desta vez."]
+            if p:
+                linhas.append(f"Semana: {fmt_dur(p['horas'])} de {fmt_dur(p['horas_previstas'])} previstas.")
+            pend = linhas_pendencias(p)
+            if pend:
+                linhas += ["", "Ficou pendente:"] + pend
+            tg_reply(msg_id, '\n'.join(linhas))
+
+        else:  # horas
+            seg, dom = semana_de(hoje)
+            m_ini, m_fim = mes_de(hoje)
+            p_sem = painel_do_operador(nome, seg, dom)
+            p_mes = painel_do_operador(nome, m_ini, m_fim)
+            linhas = [f"⏱️ {nome}"]
+            if aberto:
+                linhas.append(f"Entrada aberta desde {fmt_hm(_ts(aberto['inicio']))}.")
+            if p_sem:
+                linhas.append(f"Semana ({seg[8:10]}/{seg[5:7]}–{dom[8:10]}/{dom[5:7]}): {fmt_dur(p_sem['horas'])} "
+                              f"de {fmt_dur(p_sem['horas_previstas'])} previstas · {fmt_brl(p_sem['custo_horas'])}")
+            if p_mes:
+                linhas.append(f"Mês: {fmt_dur(p_mes['horas'])} · {fmt_brl(p_mes['custo_horas'])}")
+            if len(linhas) == 1:
+                linhas.append("Nada registrado ainda.")
+            tg_reply(msg_id, '\n'.join(linhas))
+    except Exception as e:
+        print(f"  ❌ Registro de horas: {e}", flush=True)
+        traceback.print_exc()
+        tg_reply(msg_id, f"⏱️ Deu erro no registro ({_erro_curto(e)}). Tenta de novo.")
+
+_avisou_sem_entrada = {}
+
+def aviso_sem_entrada(msg_id, nome, cadastros):
+    """Print de operador pago por hora sem entrada aberta → lembra de marcar (no máx 1x por dia)."""
+    try:
+        op = next((o for o in cadastros['operadores'] if o['nome'] == nome), None)
+        hoje = datetime.now(BRT).strftime('%Y-%m-%d')
+        if not op or _avisou_sem_entrada.get(nome) == hoje or not remunerado_por_hora(op['id'], cadastros, hoje):
+            return
+        if registro_aberto(op['id']):
+            return
+        _avisou_sem_entrada[nome] = hoje
+        tg_reply(msg_id, f"⏱️ {nome}, você está sem entrada marcada. Aperta \"Iniciar turno\" no dash das contas "
+                         f"ou manda \"entrada\" aqui pra suas horas contarem.")
+    except Exception as e:
+        print(f"  ⚠️ aviso_sem_entrada: {e}", flush=True)
+
+def ultima_atividade(op, desde):
+    """Último sinal de trabalho do operador desde a entrada: print, edição de aposta/conta ou aposta criada."""
+    q = _utc_q(desde)
+    nome = requests.utils.quote(op['nome'])
+    fontes = [
+        (f"prints_log?operador=eq.{nome}&recebido_em=gte.{q}&order=recebido_em.desc&limit=1&select=t:recebido_em"),
+        (f"historico_apostas?alterado_por=eq.{nome}&alterado_em=gte.{q}&order=alterado_em.desc&limit=1&select=t:alterado_em"),
+        (f"historico_contas?alterado_por=eq.{nome}&alterado_em=gte.{q}&order=alterado_em.desc&limit=1&select=t:alterado_em"),
+        (f"apostas?operador_id=eq.{op['id']}&criado_em=gte.{q}&order=criado_em.desc&limit=1&select=t:criado_em"),
+    ]
+    tempos = []
+    for f in fontes:
+        try:
+            rows = sb_get(f)
+            if rows and rows[0].get('t'):
+                tempos.append(_ts(rows[0]['t']))
+        except Exception as e:
+            print(f"  ⚠️ ultima_atividade: {e}", flush=True)
+    return max(tempos) if tempos else None
+
+def fechar_esquecidos(cadastros):
+    """Entrada aberta depois do fim da janela da escala (+1h) ou 6h sem escala, e sem atividade há 1h:
+    fecha na última atividade, marca como automático e avisa. O Samuel revisa no painel."""
+    if not cadastros:
+        return
+    try:
+        abertos = sb_get("registro_horas?fim=is.null&select=id,operador_id,inicio,tg_msg_inicio")
+    except Exception as e:
+        print(f"  ⚠️ fechar_esquecidos: {e}", flush=True)
+        return
+    agora = datetime.now(timezone.utc)
+    for r in abertos:
+        try:
+            op = next((o for o in cadastros['operadores'] if o['id'] == r['operador_id']), None)
+            if not op:
+                continue
+            ini = _ts(r['inicio'])
+            dia = ini.astimezone(BRT).strftime('%Y-%m-%d')
+            esc = escala_do_dia(op['id'], dia)
+            if esc:
+                fim_janela = datetime.strptime(f"{dia} {esc['janela_fim'][:5]}", '%Y-%m-%d %H:%M').replace(tzinfo=BRT)
+                limite = max(fim_janela, ini) + timedelta(hours=1)
+            else:
+                limite = ini + timedelta(hours=6)
+            if agora < limite:
+                continue
+            ult = ultima_atividade(op, ini)
+            if ult and agora - ult < timedelta(hours=1):
+                continue  # ainda trabalhando
+            fim = max(ult or ini, ini)
+            sb_patch('registro_horas', f"id=eq.{r['id']}&fim=is.null",
+                     {'fim': fim.isoformat(), 'fim_auto': True,
+                      'obs': 'fechado automaticamente na última atividade'})
+            horas = (fim - ini).total_seconds() / 3600
+            print(f"  ⏱️ Entrada esquecida de {op['nome']} fechada às {fmt_hm(fim)} ({fmt_dur(horas)})", flush=True)
+            tg_reply(r.get('tg_msg_inicio'),
+                     f"⏱️ {op['nome']} · sua entrada das {fmt_hm(ini)} ficou aberta. Fechei às {fmt_hm(fim)}, "
+                     f"na sua última atividade ({fmt_dur(horas)}). Se não for isso, o Samuel ajusta no painel.")
+        except Exception as e:
+            print(f"  ⚠️ fechar_esquecidos ({r.get('id')}): {e}", flush=True)
+
+def tg_equipe(texto, reply_to=None):
+    """Mensagem no RM Office - Chat. Devolve o message_id (ou None se não foi)."""
+    params = {'chat_id': CHAT_EQUIPE, 'text': texto[:4000], 'link_preview_options': {'is_disabled': True}}
+    if reply_to:
+        params['reply_parameters'] = {'message_id': reply_to, 'allow_sending_without_reply': True}
+    for tentativa in range(2):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TOKEN_CHAT_EQUIPE}/sendMessage", json=params, timeout=20).json()
+        except Exception as e:
+            print(f"  ⚠️ RM Office - Chat: {e}", flush=True)
+            return None
+        if r.get('ok'):
+            return r['result']['message_id']
+        espera = (r.get('parameters') or {}).get('retry_after')
+        if r.get('error_code') == 429 and espera and tentativa == 0:
+            time.sleep(min(int(espera), 10))
+            continue
+        print(f"  ⚠️ RM Office - Chat: {r.get('description')}", flush=True)
+        return None
+    return None
+
+def anunciar_turnos(cadastros):
+    """Início e fim de turno (botão do dash ou "entrada"/"saida" no Planilhar) → aviso no RM Office - Chat.
+    Olha só os últimos 10 min (não anuncia coisa velha depois de um deploy). Fora: lançamento à mão,
+    registro ajustado pelo Samuel e saída fechada pelo bot (essa vai só no Planilhar)."""
+    if not cadastros:
+        return
+    desde = _utc_q(datetime.now(timezone.utc) - timedelta(minutes=10))
+    base = "registro_horas?origem=in.(dash,telegram)&ajustado_por=is.null&select=id,operador_id,inicio,fim,aviso_inicio_msg"
+    nome_de = lambda op_id: next((o['nome'] for o in cadastros['operadores'] if o['id'] == op_id), None)
+
+    try:
+        inicios = sb_get(f"{base}&aviso_inicio_msg=is.null&inicio=gte.{desde}&order=inicio")
+    except Exception as e:
+        print(f"  ⚠️ anunciar_turnos: {e}", flush=True)
+        return
+    for r in inicios:
+        nome = nome_de(r['operador_id'])
+        if not nome:
+            continue
+        ini = _ts(r['inicio'])
+        linhas = [f"⏱️ {nome} iniciou o turno às {fmt_hm(ini)}."]
+        try:
+            esc = escala_do_dia(r['operador_id'], ini.astimezone(BRT).strftime('%Y-%m-%d'))
+        except Exception as e:
+            esc = None
+            print(f"  ⚠️ anunciar_turnos (escala): {e}", flush=True)
+        if esc:
+            linhas.append(f"Escala de hoje: {esc['janela_inicio'][:5]}–{esc['janela_fim'][:5]} · {fmt_dur(esc['horas_previstas'])}")
+        elif remunerado_por_hora(r['operador_id'], cadastros, ini.astimezone(BRT).strftime('%Y-%m-%d')):
+            linhas.append("Hoje não está na escala.")
+        mid = tg_equipe('\n'.join(linhas))
+        if mid:
+            r['aviso_inicio_msg'] = mid
+            try:
+                sb_patch('registro_horas', f"id=eq.{r['id']}", {'aviso_inicio_msg': mid})
+            except Exception as e:
+                print(f"  ⚠️ anunciar_turnos (patch início): {e}", flush=True)
+            print(f"  ⏱️ RM Office - Chat: {nome} iniciou o turno ({fmt_hm(ini)})", flush=True)
+
+    try:
+        fins = sb_get(f"{base}&aviso_fim_msg=is.null&fim_auto=is.false&fim=gte.{desde}&order=fim")
+    except Exception as e:
+        print(f"  ⚠️ anunciar_turnos: {e}", flush=True)
+        return
+    for r in fins:
+        nome = nome_de(r['operador_id'])
+        if not nome:
+            continue
+        ini, fim = _ts(r['inicio']), _ts(r['fim'])
+        linhas = [f"⏱️ {nome} encerrou o turno às {fmt_hm(fim)} · {fmt_dur((fim - ini).total_seconds() / 3600)}."]
+        seg, dom = semana_de(fim.astimezone(BRT).strftime('%Y-%m-%d'))
+        p = painel_do_operador(nome, seg, dom)
+        if p and float(p.get('horas_previstas') or 0) > 0:
+            linhas.append(f"Semana: {fmt_dur(p['horas'])} de {fmt_dur(p['horas_previstas'])} previstas.")
+        elif p:
+            linhas.append(f"Semana: {fmt_dur(p['horas'])}.")
+        mid = tg_equipe('\n'.join(linhas), reply_to=r.get('aviso_inicio_msg') or None)
+        if mid:
+            try:
+                sb_patch('registro_horas', f"id=eq.{r['id']}", {'aviso_fim_msg': mid})
+            except Exception as e:
+                print(f"  ⚠️ anunciar_turnos (patch fim): {e}", flush=True)
+            print(f"  ⏱️ RM Office - Chat: {nome} encerrou o turno ({fmt_hm(fim)})", flush=True)
+
+# ============================================================
+# LOOP DE POLLING
+# ============================================================
+def main():
+    print("🤖 Bot de Prints iniciando...")
+    print(f"  Supabase: {SUPABASE_URL}")
+    print(f"  Chat ID: {CHAT_ID}")
+
+    # Descobre o último update_id atual para NÃO processar mensagens antigas
+    initial = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                           params={'limit': 1, 'offset': -1}, timeout=15).json()
+    last_update = 0
+    if initial.get('ok') and initial.get('result'):
+        last_update = initial['result'][0]['update_id']
+    offset = last_update + 1
+    print(f"  Offset inicial: {offset}")
+
+    # Recarrega cadastros a cada 5 min pra captar novos
+    ultimo_refresh = 0
+    ultimo_check_horas = 0
+    ultimo_turnos = 0
+    cadastros = None
+
+    while True:
+        try:
+            # Refresh cadastros se passou 5 min
+            agora = time.time()
+            if agora - ultimo_refresh > 300:
+                print("🔄 Recarregando cadastros...")
+                cadastros = carregar_cadastros()
+                ultimo_refresh = agora
+                print(f"  {len(cadastros['tipsters'])} tipsters, {len(cadastros['bookies'])} bookies, {len(cadastros['operadores'])} operadores")
+
+            # Entradas esquecidas abertas → fecha na última atividade
+            if agora - ultimo_check_horas > 300:
+                ultimo_check_horas = agora
+                fechar_esquecidos(cadastros)
+
+            # Início/fim de turno → RM Office - Chat
+            if agora - ultimo_turnos >= 8:
+                ultimo_turnos = agora
+                anunciar_turnos(cadastros)
+
+            # Long polling (10s: o aviso de turno do dash não espera mais que isso)
+            r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                             params={'offset': offset, 'timeout': 10}, timeout=40)
+            if not r.ok:
+                time.sleep(5)
+                continue
+
+            data = r.json()
+            if not data.get('ok'):
+                time.sleep(5)
+                continue
+
+            for update in data['result']:
+                offset = update['update_id'] + 1
+                msg = update.get('message') or update.get('channel_post')
+                if not msg:
+                    continue
+                if msg['chat']['id'] != CHAT_ID:
+                    continue
+                processar_mensagem(msg, cadastros)
+
+        except Exception as e:
+            print(f"Loop error: {e}")
+            traceback.print_exc()
+            time.sleep(5)
+
+if __name__ == '__main__':
+    main()
