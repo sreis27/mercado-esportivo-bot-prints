@@ -666,6 +666,7 @@ V. APOSTA JÁ RESOLVIDA NO PRINT:
 W. DÚVIDAS (o operador lê na hora, no Telegram, e corrige):
    - Se algum campo que você preencheu PODE ESTAR ERRADO — número borrado ou cortado, dois valores possíveis, informação que você precisou supor — escreva em "duvidas" da própria aposta: no máximo 2 itens, cada um com até 90 caracteres, começando pelo campo e dizendo o que você assumiu. Exemplos: "odd: li 1.66, pode ser 1.68" · "stake: '1' sem 'u', assumi 1u" · "casa: sem marca d'água, usei a 1ª linha da descrição" · "entrada: bilhete cortado, não vi a linha do handicap".
    - NÃO registre dúvida sobre o que você leu com clareza, nem por falta de data no print (usar a DATA DE HOJE é o padrão). Dúvida de data só quando o print indica outro dia ("Amanhã", "Tomorrow", dia da semana, data incompleta).
+   - Odd escrita pelo operador na descrição diferente da do print ou da linha do tipster NÃO é dúvida: é a odd que ele pegou (R8). Não comente.
    - Sem dúvida real → "duvidas": []. Na dúvida se é dúvida, não registre.
    - Se NÃO encontrou nenhuma aposta, explique o motivo em "duvida_geral" (até 120 caracteres; ex.: "print mostra só o saldo da conta", "imagem cortada: não aparece seleção nem odd"). Se encontrou aposta, "duvida_geral": null.
 
@@ -1397,8 +1398,11 @@ def registrar_apostas(resultado, tg_msg_id, cadastros, data_hoje, texto_data, te
         dg = (resultado or {}).get('duvida_geral')
         rel['duvida_geral'] = dg.strip()[:140] if isinstance(dg, str) and dg.strip() else None
         return rel
+    odd_do_operador = bool(RE_ODD_OPERADOR.search(texto_data or ''))
     for ap in apostas:
         duvidas = limpar_duvidas(ap.get('duvidas'))
+        if odd_do_operador:   # R8: odd da legenda é a que ele pegou — diferença pro print não é dúvida
+            duvidas = [d for d in duvidas if not d.lower().startswith('odd')]
         try:
             ap['data_evento'] = ap.get('data_evento') or data_hoje
             if (ap.get('status') or '').upper() not in STATUS_VALIDOS:

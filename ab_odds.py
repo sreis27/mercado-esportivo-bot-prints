@@ -13,6 +13,10 @@ spec.loader.exec_module(ANTIGO)
 PROBLEMA = [18464, 18455, 18381, 18380, 18344, 18339, 18304, 18206, 18194, 18191, 18088, 18082, 18059, 18033, 18004]
 CONTROLE = [18460, 18457, 18436, 18369, 18351, 18317, 18265, 18262, 18251, 18171, 18109, 18061, 17954, 17930,
             18560, 18487, 18402, 18370, 18014, 17994, 17969, 17907]
+if os.environ.get('IDS_PROBLEMA') is not None:
+    PROBLEMA = [int(x) for x in os.environ['IDS_PROBLEMA'].split(',') if x.strip()]
+if os.environ.get('IDS_CONTROLE') is not None:
+    CONTROLE = [int(x) for x in os.environ['IDS_CONTROLE'].split(',') if x.strip()]
 RODADAS_PROBLEMA = int(os.environ.get('RODADAS_PROBLEMA', '2'))
 
 TL = threading.local()
@@ -90,7 +94,7 @@ with cf.ThreadPoolExecutor(4) as ex:
             ta = 'erro' not in a and acerto(a['odd'], v, 0.03)
             tn = 'erro' not in n and acerto(n['odd'], v, 0.03)
             print(f"#{mid} [{out['grupo']}] {out['tam']} verdade {v} | ANTIGO {fmt(a)} {'✔' if ta else '✘'} | NOVO {fmt(n)} {'✔' if tn else '✘'}"
-                  f" | linha {n.get('linha')} | conf {n.get('conf')} | log {n.get('log')} | cap {out['cap']!r}", flush=True)
+                  f" | linha {n.get('linha')} | conf antigo {a.get('conf')} novo {n.get('conf')} | log {n.get('log')} | cap {out['cap']!r}", flush=True)
 
 def placar(grupo, nome, tol):
     tot = ok = 0
@@ -102,6 +106,14 @@ def placar(grupo, nome, tol):
             ok += ('erro' not in r) and acerto(r['odd'], out['verdade'], tol)
     return f"{ok}/{tot}"
 
+def avisos(nome):
+    tot = n = 0
+    for out in res.values():
+        for r in out.get(nome, []):
+            tot += 1
+            n += bool(r.get('conf'))
+    return f"{n}/{tot}"
+print(f"COM AVISO/DÚVIDA (🤨): antigo {avisos('antigo')} · novo {avisos('novo')}", flush=True)
 for g, desc in (('P', 'odd corrigida pelo time'), ('C', 'controle (bot tinha acertado)')):
     print(f"PLACAR {desc}: antigo {placar(g, 'antigo', 0.03)} · novo {placar(g, 'novo', 0.03)}"
           f"  (exato: antigo {placar(g, 'antigo', 0)} · novo {placar(g, 'novo', 0)})", flush=True)
