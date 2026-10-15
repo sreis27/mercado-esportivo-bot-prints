@@ -4,10 +4,14 @@ Monitora o grupo 'RM Office - Planilhar', extrai dados de prints de apostas
 via Claude Vision e registra automaticamente no Supabase como PENDING.
 """
 
-import os, json, re, base64, time, traceback
+import os, io, json, re, base64, time, traceback
 from datetime import datetime, timezone, timedelta
 import requests
 import anthropic
+try:
+    from PIL import Image
+except ImportError:  # sem Pillow o print vai como veio
+    Image = None
 
 # ============================================================
 # CREDENCIAIS
@@ -82,6 +86,36 @@ def tg_react(message_id, emoji):
                        reaction=[{'type': 'emoji', 'emoji': emoji}])
     except Exception as e:
         print(f"Erro ao reagir: {e}")
+
+# ============================================================
+# PRINT PEQUENO → AMPLIADO ANTES DE IR PRO MODELO
+# Recorte de ~320x70 px (comum nos prints do Chimpa) tem letra miúda demais:
+# o modelo lê "2,9u @1,87" e troca unidade por odd. Ampliado, ele lê a linha inteira.
+# ============================================================
+def preparar_imagem(img_bytes):
+    """Devolve (bytes, media_type). Lado maior < ~920 px → amplia até 1200 px (no máximo 4x)."""
+    if Image is None or not img_bytes:
+        return img_bytes, 'image/jpeg'
+    try:
+        im = Image.open(io.BytesIO(img_bytes))
+        w, h = im.size
+        mt = Image.MIME.get(im.format, 'image/jpeg')
+        fator = min(4.0, 1200.0 / max(w, h))
+        if fator < 1.3:
+            return img_bytes, mt
+        im = im.convert('RGB').resize((round(w * fator), round(h * fator)), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, 'PNG', optimize=True)
+        mt = 'image/png'
+        if buf.tell() > 3_000_000:   # limite da API é 5 MB por imagem: print cheio de cor vai em JPEG
+            buf = io.BytesIO()
+            im.save(buf, 'JPEG', quality=90)
+            mt = 'image/jpeg'
+        print(f"  🔍 Print {w}x{h} ampliado {fator:.1f}x", flush=True)
+        return buf.getvalue(), mt
+    except Exception as e:
+        print(f"  ⚠️ preparar_imagem: {e}", flush=True)
+        return img_bytes, 'image/jpeg'
 
 # ============================================================
 # EXTRAÇÃO VIA CLAUDE VISION
@@ -202,6 +236,13 @@ REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
    
    IMPORTANTE — ODD DA LEGENDA DO TIPSTER: quando a legenda do tipster contém "Odds: X.XX" ou "Odd: X.XX" em linha rotulada (ex: "Stake: 0.50u\nOdds: 3.40"), esse é o valor primário de odd. NUNCA deixe odd em 0 quando há "Odds: X.XX" ou "Odd: X.XX" no texto — extraia diretamente.
 
+[R8.1] LINHA "Entrada: Xu @Y" — STAKE E ODD NA MESMA LINHA (Chimpa Jr e outros). O tipster escreve as duas juntas, ex: "📌 Entrada: 2,9u @1,87 | https://stake.com/...".
+   - O número colado no "u" é a STAKE em unidades ("2,9u" → 2.9). O número logo depois do "@" é a ODD ("@1,87" → 1.87). Vírgula é separador decimal.
+   - NUNCA use o número do "u" como odd. Odd igual à unidade da linha (odd 2.9 com "2,9u") é ERRO — releia a linha.
+   - Odd alta é normal em prop de jogador: "Entrada: 0,8u @6,73" → odd 6.73 (não 0.8).
+   - "@" entre dois times ("New Jersey Devils @ Detroit Red Wings") separa os times do EVENTO — não é odd. A linha do mercado ("Under 2,5", "Over 0,5", "+1,5") não é odd nem stake. Números dentro do link (https://...) não são nada.
+   - Copie o trecho dessa linha, literal (sem corrigir nem converter), no campo "linha_stake_odd" da aposta. Ex: "Entrada: 2,9u @1,87".
+
 [R9] "BH" NO CABEÇALHO = "BH CS" + COUNTER-STRIKE. Quando o cabeçalho do print contém "BH" (tipicamente "BH Tipster"), o tipster é SEMPRE "BH CS" e o esporte é SEMPRE Counter-Strike. Essa regra tem prioridade absoluta sobre outros identificadores no mesmo cabeçalho (ex: "@GuiaDasApostas" no final não muda o tipster pra GDA quando há "BH" no início).
 
 [R9.1] "Projeto Fezinha" NO CABEÇALHO = SEMPRE 1 APOSTA MÚLTIPLA, NUNCA INDIVIDUAIS. Tipsters do Projeto Fezinha SÓ enviam combinadas — nunca são feitas as entradas individuais. Regra:
@@ -284,6 +325,7 @@ REGRAS ABSOLUTAS (NUNCA QUEBRE, IMPORTÂNCIA MÁXIMA)
    - Legenda do tipster tem "Odds: X.XX"? → odd PREENCHIDA (NUNCA zero).
    - "Xu" ou "X%" em QUALQUER parte do texto? → Preenchi stake_unidades.
    - Descrição tem "odd X.XX"? → USEI esse valor, não o do print.
+   - Linha "Entrada: Xu @Y" do tipster? → odd = Y (depois do "@"), stake = X (colado no "u"). Copiei a linha em "linha_stake_odd".
    - Tipo_aposta: 1 seleção sem marcador = Simples. Não inventar Criar Aposta.
 
 ═══════════════════════════════════════════════════════════════
@@ -629,6 +671,7 @@ V. APOSTA JÁ RESOLVIDA NO PRINT:
 W. DÚVIDAS (o operador lê na hora, no Telegram, e corrige):
    - Se algum campo que você preencheu PODE ESTAR ERRADO — número borrado ou cortado, dois valores possíveis, informação que você precisou supor — escreva em "duvidas" da própria aposta: no máximo 2 itens, cada um com até 90 caracteres, começando pelo campo e dizendo o que você assumiu. Exemplos: "odd: li 1.66, pode ser 1.68" · "stake: '1' sem 'u', assumi 1u" · "casa: sem marca d'água, usei a 1ª linha da descrição" · "entrada: bilhete cortado, não vi a linha do handicap".
    - NÃO registre dúvida sobre o que você leu com clareza, nem por falta de data no print (usar a DATA DE HOJE é o padrão). Dúvida de data só quando o print indica outro dia ("Amanhã", "Tomorrow", dia da semana, data incompleta).
+   - Odd escrita pelo operador na descrição diferente da do print ou da linha do tipster NÃO é dúvida: é a odd que ele pegou (R8). Não comente.
    - Sem dúvida real → "duvidas": []. Na dúvida se é dúvida, não registre.
    - Se NÃO encontrou nenhuma aposta, explique o motivo em "duvida_geral" (até 120 caracteres; ex.: "print mostra só o saldo da conta", "imagem cortada: não aparece seleção nem odd"). Se encontrou aposta, "duvida_geral": null.
 
@@ -652,6 +695,7 @@ FORMATO DE RESPOSTA (JSON puro, sem markdown):
       "operador": "nome igual ao cadastro" ou null,
       "bookie": "nome igual ao cadastro" ou null,
       "contas_utilizadas": "separadas por vírgula" ou null,
+      "linha_stake_odd": "trecho literal onde o tipster escreveu stake e odd (ex: 'Entrada: 2,9u @1,87')" ou null,
       "duvidas": ["campo: o que você assumiu"] ou []
     }}
   ],
@@ -668,7 +712,7 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
 5. Palavra após bookie? → Preenchi a conta. Exceto se for palavra qualitativa ("Todas", "Várias") = null mas continua extração.
 6. Rótulo da casa no bilhete? → Preenchi o mercado via match semântico respeitando especificidade exata ("Chutes" ≠ "Chutes no gol"; "Vencedor" ≠ "Vencedor do Mapa").
 7. STAKE: há "Xu", "X%", "@odd / Xu", "Stake: X" em QUALQUER parte do texto (imagem + descrição)? → Preenchi stake_unidades. Nunca null se há sinal.
-8. ODD: descrição tem "odd X.XX" (ou typos "od"/"ood")? → USEI esse valor, NÃO o do print.
+8. ODD: descrição tem "odd X.XX" (ou typos "od"/"ood")? → USEI esse valor, NÃO o do print. Linha "Xu @Y" do tipster? → odd = Y (depois do "@"), NUNCA o X do "u" (R8.1).
 9. "BH" no cabeçalho? → tipster "BH CS" + esporte "Counter-Strike".
 10. Tipo_aposta: 1 seleção sem marcador especial = Simples. Não inventar Criar Aposta.
 11. Valor em USD/US$/$/USDT no bilhete ou na legenda, ou marca d'água de casa só em dólar? → stake_usd preenchido, stake_reais null, bookie pela marca d'água. Casa com R$ e US$: moeda pelo valor (R$ ou sem moeda → stake_reais).
@@ -676,7 +720,8 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
 13. Algum campo pode estar errado (leitura ambígua, valor suposto)? → "duvidas" da aposta (máx 2). Nenhuma aposta achada → "duvida_geral" com o motivo.
 """
 
-    img_b64 = base64.b64encode(imagem_bytes).decode('ascii')
+    img_modelo, media_type = preparar_imagem(imagem_bytes)
+    img_b64 = base64.b64encode(img_modelo).decode('ascii')
 
     # Retry com backoff exponencial para erros transitórios da Anthropic API
     # (529 Overloaded, 429 Rate Limit, 503 Service Unavailable, falhas de conexão)
@@ -702,7 +747,7 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
                 messages=[{
                     "role": "user",
                     "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
                         {"type": "text", "text": contexto_variavel}
                     ]
                 }]
@@ -758,7 +803,7 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
         print(f"  ⚠️ JSONDecodeError: {e}")
         print(f"     Texto: {text[:500]}")
         return {'apostas': []}
-    return reforcar_stake(client, resultado, imagem_bytes, descricao_msg)
+    return reforcar_stake(client, resultado, img_modelo, descricao_msg, media_type)
 
 
 # ============================================================
@@ -774,14 +819,14 @@ PROMPT_STAKE = (
     "Responda APENAS com JSON: {\"stake_unidades\": numero ou null}. Use null só se não houver NENHUM número ligado a u/%/stake."
 )
 
-def extrair_stake_focado(client, imagem_bytes, descricao_msg):
+def extrair_stake_focado(client, imagem_bytes, descricao_msg, media_type='image/jpeg'):
     try:
         img_b64 = base64.b64encode(imagem_bytes).decode('ascii')
         r = client.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=60,
             messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
                 {"type": "text", "text": PROMPT_STAKE + f"\n\nDESCRIÇÃO DO OPERADOR: \"{descricao_msg or '(sem descrição)'}\""},
             ]}],
         )
@@ -794,10 +839,10 @@ def extrair_stake_focado(client, imagem_bytes, descricao_msg):
         print(f"  ⚠️ Reforço de stake falhou: {e}", flush=True)
     return None
 
-def reforcar_stake(client, resultado, imagem_bytes, descricao_msg):
+def reforcar_stake(client, resultado, imagem_bytes, descricao_msg, media_type='image/jpeg'):
     aps = (resultado or {}).get('apostas') or []
     if len(aps) == 1 and aps[0].get('stake_unidades') is None and aps[0].get('stake_reais') is None and aps[0].get('stake_usd') is None:
-        su = extrair_stake_focado(client, imagem_bytes, descricao_msg)
+        su = extrair_stake_focado(client, imagem_bytes, descricao_msg, media_type)
         if su is not None:
             aps[0]['stake_unidades'] = su
             print(f"  🎯 Stake recuperada no reforço: {su}u", flush=True)
@@ -834,6 +879,85 @@ def textos_extras(msg):
     t = rt.get('caption') or rt.get('text')
     if t: partes.append(t)
     return '\n'.join(partes)
+
+# ============================================================
+# LINHA "Entrada: 2,9u @1,87" — trava determinística da odd
+# O modelo às vezes registra a unidade (2.9) como odd. Aqui a linha é lida por
+# regex: da transcrição literal que o próprio modelo devolve (linha_stake_odd)
+# ou do texto do tipster citado/encaminhado junto do print.
+# ============================================================
+RE_URL = re.compile(r'(?:https?://|www\.)\S+', re.IGNORECASE)
+RE_ODD_MIN = re.compile(r'\bm[ií]n(?:ima|imo)?\.?\s*[:\-–]?\s*@?\s*\d{1,3}(?:[.,]\d{1,4})?', re.IGNORECASE)
+RE_UNID_LINHA = re.compile(r'(?<![\w.,])(\d{1,2}(?:[.,]\d{1,3})?)\s*(?:u|un|unid|unidades?)\b', re.IGNORECASE)
+RE_ODD_ARROBA = re.compile(r'@\s*(\d{1,3}(?:[.,]\d{1,4})?)(?!\w|[.,]\d)')
+# odd escrita pelo OPERADOR na legenda ("odd 1,90", "od 2.1", "@1.90") — R8: prevalece, a trava não mexe
+RE_ODD_OPERADOR = re.compile(r'(?:\b(?:odds?|ood|od)\s*[:=]?\s*|@\s*)\d', re.IGNORECASE)
+
+def _num_br(s):
+    return float(s.replace(',', '.'))
+
+def _fmt_odd(v):
+    """7.846 → '7,846' · 1.9 → '1,9' (odd com até 3 casas, como o tipster escreve)."""
+    try:
+        return f"{float(v):.3f}".rstrip('0').rstrip('.').replace('.', ',')
+    except (TypeError, ValueError):
+        return str(v)
+
+def _igual(a, b):
+    try:
+        return a is not None and b is not None and abs(float(a) - float(b)) < 0.006
+    except (TypeError, ValueError):
+        return False
+
+def ler_linha_tipster(texto):
+    """'📌 Entrada: 2,9u @1,87 | https://…' → (2.9, 1.87). Só devolve o inequívoco: uma unidade e uma odd '@'."""
+    t = RE_ODD_MIN.sub(' ', RE_URL.sub(' ', texto or ''))
+    us = {_num_br(x) for x in RE_UNID_LINHA.findall(t)}
+    ods = {_num_br(x) for x in RE_ODD_ARROBA.findall(t)}
+    u = next(iter(us)) if len(us) == 1 else None
+    o = next(iter(ods)) if len(ods) == 1 else None
+    if u is not None and not (0 < u <= 50):
+        u = None
+    if o is not None and not (1.01 <= o <= 1000):
+        o = None
+    return u, o
+
+def conferir_linha_tipster(ap, fontes, descricao_operador):
+    """Confere odd/stake do modelo contra a linha 'Xu @Y'. Troca unidade↔odd: corrige sozinho.
+    Odd que não bate com nada da linha: usa a da linha e devolve dúvida (o operador confere).
+    Marca ap['_unid_tipster'] quando a unidade é a da linha — com valor na legenda, vale o valor."""
+    duvidas = []
+    for fonte in fontes:
+        u, o = ler_linha_tipster(fonte)
+        if o is None:
+            continue
+        odd, su = ap.get('odd'), ap.get('stake_unidades')
+        if not RE_ODD_OPERADOR.search(descricao_operador or ''):
+            try:
+                odd_ok = odd is not None and float(odd) >= 1.01
+            except (TypeError, ValueError):
+                odd_ok = False
+            if not odd_ok:
+                ap['odd'] = o
+                print(f"  🔀 odd {odd} → {o} pela linha do tipster ('{fonte[:70]}')", flush=True)
+            elif _igual(odd, o):
+                pass
+            elif _igual(odd, u):
+                ap['odd'] = o
+                print(f"  🔀 odd {odd} era a unidade → {o} ('{fonte[:70]}')", flush=True)
+            else:
+                ap['odd'] = o
+                duvidas.append(f"odd: li {_fmt_odd(odd)}, mas a linha do tipster diz @{_fmt_odd(o)} — usei {_fmt_odd(o)}")
+                print(f"  🔀 odd {odd} não bate com a linha → {o} ('{fonte[:70]}')", flush=True)
+        if u is not None:
+            if _igual(su, o) and not _igual(u, o):        # pôs a odd na unidade
+                ap['stake_unidades'] = su = u
+            if su is None and ap.get('stake_reais') is None and ap.get('stake_usd') is None:
+                ap['stake_unidades'] = su = u
+            if _igual(su, u):
+                ap['_unid_tipster'] = True
+        break
+    return duvidas
 
 def log_estrutura(msg):
     try:
@@ -1162,6 +1286,9 @@ def montar_linha(ap, cadastros, tg_msg_id=None):
     # Casa que aceita as duas (AMBAS, ex.: Stake): vale o valor lido — sem valor em dólar, fica em R$.
     moeda_casa = next((b.get('moeda') for b in cadastros['bookies'] if b['id'] == bookie_id), 'BRL') if bookie_id else 'BRL'
     moeda = 'USD' if (su_usd or moeda_casa == 'USD') else 'BRL'
+    # Unidade veio da linha do tipster ("2,9u") e a legenda tem o valor apostado ("20 usd"):
+    # vale o valor — a unidade é valor ÷ unidade do tipster (o que o operador de fato apostou).
+    unid_tipster = bool(ap.get('_unid_tipster'))
 
     if moeda == 'USD':
         if not su_usd and sr:          # modelo pôs o valor em dólar no campo de reais
@@ -1169,7 +1296,7 @@ def montar_linha(ap, cadastros, tg_msg_id=None):
         sr = None
         svu = get_stake_valor_usd(tipster_id, data_ev, cadastros.get('stakes_usd'))
         if svu:
-            if su_usd and not su:
+            if su_usd and (not su or unid_tipster):
                 su = round(su_usd / svu, 4)
             elif su and not su_usd:
                 su_usd = round(su * svu, 2)
@@ -1177,10 +1304,10 @@ def montar_linha(ap, cadastros, tg_msg_id=None):
     elif tipster_id and data_ev:
         sv = get_stake_valor(tipster_id, data_ev, cadastros['stakes'])
         if sv:
-            if su and not sr:
-                sr = su * sv
-            elif sr and not su:
+            if sr and (not su or unid_tipster):
                 su = round(sr / sv, 2)
+            elif su and not sr:
+                sr = su * sv
 
     status = (ap.get('status') or '').upper().strip()
     status = status if status in STATUS_VALIDOS else 'PENDING'
@@ -1265,17 +1392,22 @@ def _fmt_data_br(s):
 def _erro_curto(e):
     return (str(e).split(' for url')[0].strip() or e.__class__.__name__)[:80]
 
-def registrar_apostas(resultado, tg_msg_id, cadastros, data_hoje, texto_data, texto_bookie, criado_por=None):
+def registrar_apostas(resultado, tg_msg_id, cadastros, data_hoje, texto_data, texto_bookie, criado_por=None,
+                      texto_tipster=''):
     """Grava as apostas extraídas e devolve o relatório: o que entrou (com avisos/dúvidas) e o que falhou.
-    criado_por = quem mandou o print (base da produtividade de cada um)."""
+    criado_por = quem mandou o print (base da produtividade de cada um).
+    texto_tipster = texto do tipster citado/encaminhado junto do print (confere a linha 'Xu @Y')."""
     rel = novo_relatorio()
     apostas = (resultado or {}).get('apostas') or []
     if not apostas:
         dg = (resultado or {}).get('duvida_geral')
         rel['duvida_geral'] = dg.strip()[:140] if isinstance(dg, str) and dg.strip() else None
         return rel
+    odd_do_operador = bool(RE_ODD_OPERADOR.search(texto_data or ''))
     for ap in apostas:
         duvidas = limpar_duvidas(ap.get('duvidas'))
+        if odd_do_operador:   # R8: odd da legenda é a que ele pegou — diferença pro print não é dúvida
+            duvidas = [d for d in duvidas if not d.lower().startswith('odd')]
         try:
             ap['data_evento'] = ap.get('data_evento') or data_hoje
             if (ap.get('status') or '').upper() not in STATUS_VALIDOS:
@@ -1287,6 +1419,11 @@ def registrar_apostas(resultado, tg_msg_id, cadastros, data_hoje, texto_data, te
                 ap['bookie'] = bookie_da_descricao(texto_bookie, cadastros)
                 if ap['bookie']:
                     print(f"  🏦 Bookie pela descrição: {ap['bookie']}", flush=True)
+            # Linha "Entrada: 2,9u @1,87": texto real do tipster primeiro, depois a transcrição do modelo
+            fontes = [texto_tipster] if texto_tipster and len(apostas) == 1 else []
+            if isinstance(ap.get('linha_stake_odd'), str) and ap['linha_stake_odd'].strip():
+                fontes.append(ap['linha_stake_odd'])
+            duvidas += conferir_linha_tipster(ap, fontes, texto_data)
             linha = montar_linha(ap, cadastros, tg_msg_id=tg_msg_id)
             if not linha.get('data_evento'):
                 linha['data_evento'] = data_hoje
@@ -1456,7 +1593,8 @@ def processar_mensagem(msg, cadastros):
 
         data_hoje = datetime.now(BRT).strftime('%Y-%m-%d')
         resultado = extrair_aposta(img_bytes, texto_modelo, cadastros, data_hoje, operador_nome)
-        rel = registrar_apostas(resultado, msg_id, cadastros, data_hoje, texto, texto, criado_por=operador_nome)
+        rel = registrar_apostas(resultado, msg_id, cadastros, data_hoje, texto, texto, criado_por=operador_nome,
+                                texto_tipster=extras)
 
         res = reagir_pelo_relatorio(msg_id, rel)
         n = len(rel['itens'])
