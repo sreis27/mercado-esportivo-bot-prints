@@ -13,6 +13,10 @@ try:
 except ImportError:  # sem Pillow o print vai como veio
     Image = None
 
+# Modelo que lê os prints. O claude-sonnet-4-5 sai do ar em 30/11/2026; trocado depois do teste
+# lado a lado nos prints reais (nov/2026). Dá pra forçar outro pela variável MODELO_PRINTS no Railway.
+MODELO_PRINTS = os.environ.get('MODELO_PRINTS', 'claude-sonnet-5-5')
+
 # ============================================================
 # CREDENCIAIS
 # ============================================================
@@ -64,9 +68,30 @@ def sb_delete(table, where):
     r.raise_for_status()
     return True
 
+# Desde nov/2026 a conexão Railway → Telegram cai de vez em quando no handshake
+# ("Connection reset by peer"). Sem nova tentativa, o print inteiro falhava.
+TG_ESPERAS = (1, 3, 6)   # segundos antes da 2ª, 3ª e 4ª tentativa
+TG_NAO_IDEMPOTENTE = {'sendMessage', 'sendPhoto', 'sendDocument', 'forwardMessage', 'copyMessage'}
+
+def _tg_requisicao(fazer, idempotente=True, rotulo='Telegram'):
+    """Executa a requisição e repete em falha de rede passageira. Falha de conexão (o pedido não
+    chegou) repete sempre; timeout de leitura (o pedido pode ter chegado) só repete o idempotente,
+    pra não mandar mensagem duplicada."""
+    for tentativa in range(len(TG_ESPERAS) + 1):
+        try:
+            return fazer()
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            leitura = isinstance(e, requests.exceptions.ReadTimeout)
+            if tentativa == len(TG_ESPERAS) or (leitura and not idempotente):
+                raise
+            espera = TG_ESPERAS[tentativa]
+            print(f"  🔁 {rotulo}: {type(e).__name__} — tentando de novo em {espera}s", flush=True)
+            time.sleep(espera)
+
 def tg_call(method, **params):
-    r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
-                      json=params, timeout=30)
+    r = _tg_requisicao(lambda: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
+                                             json=params, timeout=30),
+                       idempotente=method not in TG_NAO_IDEMPOTENTE, rotulo=f"Telegram {method}")
     return r.json()
 
 def tg_get_file_bytes(file_id):
@@ -75,7 +100,8 @@ def tg_get_file_bytes(file_id):
     if not info.get('ok'):
         return None
     path = info['result']['file_path']
-    r = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}", timeout=60)
+    r = _tg_requisicao(lambda: requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}", timeout=60),
+                       rotulo="Telegram download")
     return r.content if r.ok else None
 
 def tg_react(message_id, emoji):
@@ -106,8 +132,13 @@ def preparar_imagem(img_bytes):
         im = im.convert('RGB').resize((round(w * fator), round(h * fator)), Image.LANCZOS)
         buf = io.BytesIO()
         im.save(buf, 'PNG', optimize=True)
+        mt = 'image/png'
+        if buf.tell() > 3_000_000:   # limite da API é 5 MB por imagem: print cheio de cor vai em JPEG
+            buf = io.BytesIO()
+            im.save(buf, 'JPEG', quality=90)
+            mt = 'image/jpeg'
         print(f"  🔍 Print {w}x{h} ampliado {fator:.1f}x", flush=True)
-        return buf.getvalue(), 'image/png'
+        return buf.getvalue(), mt
     except Exception as e:
         print(f"  ⚠️ preparar_imagem: {e}", flush=True)
         return img_bytes, 'image/jpeg'
@@ -725,7 +756,7 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
     for tentativa in range(len(backoffs) + 1):
         try:
             resp = client.messages.create(
-                model="claude-sonnet-4-5",
+                model=MODELO_PRINTS,
                 max_tokens=2000,
                 system=[
                     {
@@ -818,7 +849,7 @@ def extrair_stake_focado(client, imagem_bytes, descricao_msg, media_type='image/
     try:
         img_b64 = base64.b64encode(imagem_bytes).decode('ascii')
         r = client.messages.create(
-            model="claude-sonnet-4-5",
+            model=MODELO_PRINTS,
             max_tokens=60,
             messages=[{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
@@ -1865,7 +1896,9 @@ def tg_equipe(texto, reply_to=None):
         params['reply_parameters'] = {'message_id': reply_to, 'allow_sending_without_reply': True}
     for tentativa in range(2):
         try:
-            r = requests.post(f"https://api.telegram.org/bot{TOKEN_CHAT_EQUIPE}/sendMessage", json=params, timeout=20).json()
+            r = _tg_requisicao(lambda: requests.post(f"https://api.telegram.org/bot{TOKEN_CHAT_EQUIPE}/sendMessage",
+                                                     json=params, timeout=20),
+                               idempotente=False, rotulo="RM Office - Chat").json()
         except Exception as e:
             print(f"  ⚠️ RM Office - Chat: {e}", flush=True)
             return None
@@ -2007,6 +2040,10 @@ def main():
                     continue
                 processar_mensagem(msg, cadastros)
 
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # queda passageira no getUpdates: só tenta de novo (sem traceback enchendo o log)
+            print(f"Loop: rede ({type(e).__name__}) — tentando de novo em 5s", flush=True)
+            time.sleep(5)
         except Exception as e:
             print(f"Loop error: {e}")
             traceback.print_exc()
