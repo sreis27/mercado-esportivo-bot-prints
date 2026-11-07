@@ -17,8 +17,8 @@ except ImportError:  # sem Pillow o print vai como veio
 # lado a lado nos prints reais (nov/2026). Dá pra forçar outro pela variável MODELO_PRINTS no Railway.
 MODELO_PRINTS = os.environ.get('MODELO_PRINTS', 'claude-sonnet-5-5')
 # Nos modelos 5.x o pensamento vem ligado por padrão (e a resposta traz um bloco de pensamento antes do texto).
-# Desligado fica como era no 4.5: mais rápido e mais barato. PENSAR_PRINTS=sim no Railway liga.
-PENSAR_PRINTS = os.environ.get('PENSAR_PRINTS', 'nao').strip().lower() in ('sim', 's', '1', 'true')
+# Ligado acertou mais nos prints reais (tipster, odd, unidade) pelo mesmo custo do 4.5; PENSAR_PRINTS=nao no Railway desliga.
+PENSAR_PRINTS = os.environ.get('PENSAR_PRINTS', 'sim').strip().lower() in ('sim', 's', '1', 'true')
 
 def opcoes_modelo(max_tokens):
     """max_tokens e pensamento pro modelo que lê os prints."""
@@ -419,6 +419,7 @@ D. DATA DO EVENTO — prioridade de fontes (use a primeira disponível):
    2. DATA EXPLÍCITA NA DESCRIÇÃO: se o operador escreveu uma data na descrição, use essa.
    3. "LIVE" ou "AO VIVO" no print: a partida é HOJE (usar DATA DE HOJE do contexto).
    4. Nenhum dos anteriores: use a DATA DE HOJE do contexto como fallback.
+   MÚLTIPLA (dupla, tripla...) com jogos em dias diferentes: data_evento = a data do ÚLTIMO jogo (o mais tarde), que é quando a aposta fecha. Nunca a do primeiro.
    NUNCA infira data de evento por conhecimento prévio de calendário esportivo — o Claude Vision não tem acesso a dados em tempo real e pode errar. Só use datas que estejam EXPLICITAMENTE escritas no print ou na descrição.
 
    CUIDADO — IDENTIFICADORES DE GRUPO/TEMPORADA NÃO SÃO DATAS: strings em formato "AAAA.MM [texto]", "T[N]", "Season [N]", "[AAAA].[MM] [nome]" no cabeçalho, logo ou nome do canal do tipster são identificadores de grupo/temporada, NÃO são data do evento. Exemplos:
@@ -748,7 +749,7 @@ Responda APENAS com o JSON.
 
 ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
 1. Bet builder? → Print tem "CRIAR APOSTA"/"BET BUILDER" OU sinais estruturais (múltiplas seleções do mesmo jogador/jogo + 1 odd + 1 valor APOSTAR + sem botões individuais + opcionalmente "N Seleções" em destaque)? → 1 item só, tipo "Criar Aposta", entrada concatenada. Se NÃO, não invente.
-2. Data veio de texto EXPLÍCITO do print/descrição? → Se não, use a DATA DE HOJE do contexto.
+2. Data veio de texto EXPLÍCITO do print/descrição? → Se não, use a DATA DE HOJE do contexto. Múltipla com jogos em dias diferentes → a data do ÚLTIMO jogo.
 3. Times conhecidos? → Esporte marcado (específico: NBA/WNBA/Futebol Feminino se existir).
 4. Descrição começa com bookie? → Preenchi o bookie (incluindo "365"→Bet365, "AG"→Aposta Ganha).
 5. Palavra após bookie? → Preenchi a conta. Exceto se for palavra qualitativa ("Todas", "Várias") = null mas continua extração.
@@ -840,10 +841,13 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
             return {'apostas': []}
 
     try:
-        resultado = json.loads(text)
+        # raw_decode: lê o JSON do começo e ignora o que o modelo escrever depois dele
+        resultado, _ = json.JSONDecoder().raw_decode(text)
     except json.JSONDecodeError as e:
         print(f"  ⚠️ JSONDecodeError: {e}")
         print(f"     Texto: {text[:500]}")
+        return {'apostas': []}
+    if not isinstance(resultado, dict):
         return {'apostas': []}
     return reforcar_stake(client, resultado, img_modelo, descricao_msg, media_type)
 
