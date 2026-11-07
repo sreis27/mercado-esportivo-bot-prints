@@ -36,7 +36,18 @@ LOGIN_TOKEN   = os.environ.get("LOGIN_TOKEN", "")
 SESSAO        = os.environ.get("SESSAO_PATH", "/data/leitor")
 PORTA         = int(os.environ.get("PORT", "8080"))
 DIAS_HIST     = int(os.environ.get("DIAS_HISTORICO", "14"))
-MODELO        = os.environ.get("MODELO_TIPS", "claude-sonnet-4-5")
+MODELO        = os.environ.get("MODELO_TIPS", "claude-sonnet-5-5")
+
+def _opcoes_modelo(max_tokens):
+    """Nos modelos 5.x o pensamento vem ligado por padrão; aqui fica desligado (mais rápido e mais barato)."""
+    if re.match(r'claude-(sonnet|opus|haiku)-[34]', MODELO or ''):
+        return {'max_tokens': max_tokens}
+    return {'max_tokens': max_tokens, 'extra_body': {'thinking': {'type': 'between_tools'}}}
+
+def _texto(resp):
+    """Só o texto da resposta (ignora os blocos de pensamento)."""
+    return ''.join(getattr(b, 'text', '') or '' for b in (getattr(resp, 'content', None) or [])
+                   if getattr(b, 'type', '') == 'text')
 
 JANELA_H     = 6      # aposta até 6h depois da tip pode casar com ela
 SEM_APOSTA_H = 3      # tip sem aposta depois de 3h → 'sem_aposta'
@@ -136,7 +147,7 @@ def extrair_tips(texto, imagem=None):
     for tentativa, espera in enumerate([2, 5, 10, None]):
         try:
             resp = _cliente_ia().messages.create(
-                model=MODELO, max_tokens=900,
+                model=MODELO, **_opcoes_modelo(900),
                 system=[{"type": "text", "text": PROMPT_TIPS, "cache_control": {"type": "ephemeral"}}],
                 messages=[{"role": "user", "content": conteudo}])
             break
@@ -146,7 +157,7 @@ def extrair_tips(texto, imagem=None):
                 raise
             print(f"  ⏳ Claude {status or 'conexão'} — tentando de novo em {espera}s", flush=True)
             time.sleep(espera)
-    bruto = resp.content[0].text.strip()
+    bruto = _texto(resp).strip()
     bruto = re.sub(r'^```(?:json)?\s*|\s*```$', '', bruto)
     m = re.search(r'\{.*\}', bruto, re.S)
     try:

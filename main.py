@@ -16,6 +16,22 @@ except ImportError:  # sem Pillow o print vai como veio
 # Modelo que lê os prints. O claude-sonnet-4-5 sai do ar em 30/11/2026; trocado depois do teste
 # lado a lado nos prints reais (nov/2026). Dá pra forçar outro pela variável MODELO_PRINTS no Railway.
 MODELO_PRINTS = os.environ.get('MODELO_PRINTS', 'claude-sonnet-5-5')
+# Nos modelos 5.x o pensamento vem ligado por padrão (e a resposta traz um bloco de pensamento antes do texto).
+# Desligado fica como era no 4.5: mais rápido e mais barato. PENSAR_PRINTS=sim no Railway liga.
+PENSAR_PRINTS = os.environ.get('PENSAR_PRINTS', 'nao').strip().lower() in ('sim', 's', '1', 'true')
+
+def opcoes_modelo(max_tokens):
+    """max_tokens e pensamento pro modelo que lê os prints."""
+    if re.match(r'claude-(sonnet|opus|haiku)-[34]', MODELO_PRINTS or ''):
+        return {'max_tokens': max_tokens}          # modelos antigos: sem pensamento por padrão
+    if PENSAR_PRINTS:
+        return {'max_tokens': max_tokens + 8000}   # o pensamento conta dentro do max_tokens
+    return {'max_tokens': max_tokens, 'extra_body': {'thinking': {'type': 'between_tools'}}}
+
+def texto_do_modelo(resp):
+    """Só o texto da resposta (ignora os blocos de pensamento)."""
+    return ''.join(getattr(b, 'text', '') or '' for b in (getattr(resp, 'content', None) or [])
+                   if getattr(b, 'type', '') == 'text')
 
 # ============================================================
 # CREDENCIAIS
@@ -757,7 +773,7 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
         try:
             resp = client.messages.create(
                 model=MODELO_PRINTS,
-                max_tokens=2000,
+                **opcoes_modelo(2000),
                 system=[
                     {
                         "type": "text",
@@ -792,7 +808,7 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
                 continue
             raise
 
-    text_raw = resp.content[0].text
+    text_raw = texto_do_modelo(resp)
 
     # Log de cache (pra acompanhar economia nos logs do Railway)
     try:
@@ -850,13 +866,13 @@ def extrair_stake_focado(client, imagem_bytes, descricao_msg, media_type='image/
         img_b64 = base64.b64encode(imagem_bytes).decode('ascii')
         r = client.messages.create(
             model=MODELO_PRINTS,
-            max_tokens=60,
+            **opcoes_modelo(60),
             messages=[{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
                 {"type": "text", "text": PROMPT_STAKE + f"\n\nDESCRIÇÃO DO OPERADOR: \"{descricao_msg or '(sem descrição)'}\""},
             ]}],
         )
-        raw = r.content[0].text.strip()
+        raw = texto_do_modelo(r).strip()
         m = re.search(r'\{.*\}', raw, re.DOTALL)
         val = json.loads(m.group(0)).get('stake_unidades') if m else None
         if isinstance(val, (int, float)) and 0 < val <= 50:
