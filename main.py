@@ -13,6 +13,27 @@ try:
 except ImportError:  # sem Pillow o print vai como veio
     Image = None
 
+# Modelo que lê os prints. O claude-sonnet-4-5 sai do ar em 30/11/2026; trocado depois do teste
+# lado a lado nos prints reais (nov/2026). Dá pra forçar outro pela variável MODELO_PRINTS no Railway.
+MODELO_PRINTS = os.environ.get('MODELO_PRINTS', 'claude-sonnet-5-5')
+# Nos modelos 5.x o pensamento vem ligado por padrão (e a resposta traz um bloco de pensamento antes do texto).
+# Ligado acertou mais nos prints reais (tipster, odd, unidade) e ainda sai mais barato e mais rápido que o 4.5
+# (teste de 07/11/2026). PENSAR_PRINTS=nao no Railway desliga.
+PENSAR_PRINTS = os.environ.get('PENSAR_PRINTS', 'sim').strip().lower() in ('sim', 's', '1', 'true')
+
+def opcoes_modelo(max_tokens):
+    """max_tokens e pensamento pro modelo que lê os prints."""
+    if re.match(r'claude-(sonnet|opus|haiku)-[34]', MODELO_PRINTS or ''):
+        return {'max_tokens': max_tokens}          # modelos antigos: sem pensamento por padrão
+    if PENSAR_PRINTS:
+        return {'max_tokens': max_tokens + 8000}   # o pensamento conta dentro do max_tokens
+    return {'max_tokens': max_tokens, 'extra_body': {'thinking': {'type': 'between_tools'}}}
+
+def texto_do_modelo(resp):
+    """Só o texto da resposta (ignora os blocos de pensamento)."""
+    return ''.join(getattr(b, 'text', '') or '' for b in (getattr(resp, 'content', None) or [])
+                   if getattr(b, 'type', '') == 'text')
+
 # ============================================================
 # CREDENCIAIS
 # ============================================================
@@ -399,6 +420,7 @@ D. DATA DO EVENTO — prioridade de fontes (use a primeira disponível):
    2. DATA EXPLÍCITA NA DESCRIÇÃO: se o operador escreveu uma data na descrição, use essa.
    3. "LIVE" ou "AO VIVO" no print: a partida é HOJE (usar DATA DE HOJE do contexto).
    4. Nenhum dos anteriores: use a DATA DE HOJE do contexto como fallback.
+   MÚLTIPLA (dupla, tripla...) com jogos em dias diferentes: data_evento = a data do ÚLTIMO jogo (o mais tarde), que é quando a aposta fecha. Nunca a do primeiro.
    NUNCA infira data de evento por conhecimento prévio de calendário esportivo — o Claude Vision não tem acesso a dados em tempo real e pode errar. Só use datas que estejam EXPLICITAMENTE escritas no print ou na descrição.
 
    CUIDADO — IDENTIFICADORES DE GRUPO/TEMPORADA NÃO SÃO DATAS: strings em formato "AAAA.MM [texto]", "T[N]", "Season [N]", "[AAAA].[MM] [nome]" no cabeçalho, logo ou nome do canal do tipster são identificadores de grupo/temporada, NÃO são data do evento. Exemplos:
@@ -728,7 +750,7 @@ Responda APENAS com o JSON.
 
 ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
 1. Bet builder? → Print tem "CRIAR APOSTA"/"BET BUILDER" OU sinais estruturais (múltiplas seleções do mesmo jogador/jogo + 1 odd + 1 valor APOSTAR + sem botões individuais + opcionalmente "N Seleções" em destaque)? → 1 item só, tipo "Criar Aposta", entrada concatenada. Se NÃO, não invente.
-2. Data veio de texto EXPLÍCITO do print/descrição? → Se não, use a DATA DE HOJE do contexto.
+2. Data veio de texto EXPLÍCITO do print/descrição? → Se não, use a DATA DE HOJE do contexto. Múltipla com jogos em dias diferentes → a data do ÚLTIMO jogo.
 3. Times conhecidos? → Esporte marcado (específico: NBA/WNBA/Futebol Feminino se existir).
 4. Descrição começa com bookie? → Preenchi o bookie (incluindo "365"→Bet365, "AG"→Aposta Ganha).
 5. Palavra após bookie? → Preenchi a conta. Exceto se for palavra qualitativa ("Todas", "Várias") = null mas continua extração.
@@ -752,8 +774,8 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
     for tentativa in range(len(backoffs) + 1):
         try:
             resp = client.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=2000,
+                model=MODELO_PRINTS,
+                **opcoes_modelo(2000),
                 system=[
                     {
                         "type": "text",
@@ -788,7 +810,7 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
                 continue
             raise
 
-    text_raw = resp.content[0].text
+    text_raw = texto_do_modelo(resp)
 
     # Log de cache (pra acompanhar economia nos logs do Railway)
     try:
@@ -820,10 +842,13 @@ ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
             return {'apostas': []}
 
     try:
-        resultado = json.loads(text)
+        # raw_decode: lê o JSON do começo e ignora o que o modelo escrever depois dele
+        resultado, _ = json.JSONDecoder().raw_decode(text)
     except json.JSONDecodeError as e:
         print(f"  ⚠️ JSONDecodeError: {e}")
         print(f"     Texto: {text[:500]}")
+        return {'apostas': []}
+    if not isinstance(resultado, dict):
         return {'apostas': []}
     return reforcar_stake(client, resultado, img_modelo, descricao_msg, media_type)
 
@@ -845,14 +870,14 @@ def extrair_stake_focado(client, imagem_bytes, descricao_msg, media_type='image/
     try:
         img_b64 = base64.b64encode(imagem_bytes).decode('ascii')
         r = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=60,
+            model=MODELO_PRINTS,
+            **opcoes_modelo(60),
             messages=[{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
                 {"type": "text", "text": PROMPT_STAKE + f"\n\nDESCRIÇÃO DO OPERADOR: \"{descricao_msg or '(sem descrição)'}\""},
             ]}],
         )
-        raw = r.content[0].text.strip()
+        raw = texto_do_modelo(r).strip()
         m = re.search(r'\{.*\}', raw, re.DOTALL)
         val = json.loads(m.group(0)).get('stake_unidades') if m else None
         if isinstance(val, (int, float)) and 0 < val <= 50:
