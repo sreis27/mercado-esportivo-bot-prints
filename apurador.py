@@ -153,7 +153,7 @@ Cada perna (omita as chaves que não se aplicam):
   "outro" = qualquer mercado que não cabe acima (método de vitória, placar exato, intervalo/final, primeiro a marcar, etc.).
 - "met": o que se conta. Use: "gols", "pontos", "cartoes", "escanteios", "chutes", "chutes_no_gol", "faltas", "impedimentos", "rebotes", "assistencias", "triplos", "roubos", "tocos", "turnovers", "recepcoes", "jardas_recebidas", "jardas_corridas", "jardas_passe", "defesas". Soma de estatísticas numa linha só: junte com "+", ex.: "pontos+rebotes+assistencias". Se não estiver na lista, escreva um nome curto. Em handicap e total, se omitido vale gols (futebol, hóquei) ou pontos (NBA, NFL).
 - "per": "jogo" (padrão, pode omitir) | "1t" | "2t" (tempo ou metade) | "q1".."q4" (quarto) | "1p".."3p" (período do hóquei).
-- "regra": "pa" quando a entrada diz "com PA", "pagamento antecipado", "2 gols de vantagem" ou parecido.
+- "regra": "pa" quando a entrada diz "com PA", "(com PA)", "pagamento antecipado", "2 gols de vantagem" ou parecido; "sem_pa" quando diz "sem PA" ou "(sem PA)" (o dono avisa que a casa não paga antecipado). PA aqui é sempre pagamento antecipado, nunca conta ou nome. Sem nada disso, omita "regra".
 
 CONVENÇÕES DO TEXTO
 - "Over", "Mais de", "Acima", "X+" e "+X" antes de uma estatística ("+6.5 Assistências", "12.5+ Pontos") = over. "Under", "Menos de", "Abaixo" e "-X" antes de uma estatística ("-9.5 Pontos") = under.
@@ -746,7 +746,7 @@ def apura_perna(p, jogo, ia, ap):
                         raise NaoSei('regra_casa', 'pagamento antecipado: não deu pra ver se abriu 2 gols')
                     if abriu:
                         return 'WON', ev + ' (abriu 2 gols: pagamento antecipado)', None
-                elif abriu is not False:
+                elif p.get('regra') != 'sem_pa' and abriu is not False:       # "sem PA" escrito: perdeu e pronto
                     return 'LOST', ev, 'abriu 2 gols de vantagem e não ganhou: se a casa paga antecipado, é green'
             return ('WON' if ganhou else 'LOST'), ev, None
         if tipo == 'empate_anula':
@@ -1459,7 +1459,7 @@ def divergencias():
     aps = {}
     ids = [t['aposta_id'] for t in abertas]
     for i in range(0, len(ids), 100):
-        for a in sb_get('apostas?select=id,data_evento,evento,entrada,tipo_aposta,status,odd,moeda,stake_reais,stake_usd,bookie_id&id=in.('
+        for a in sb_get('apostas?select=id,data_evento,evento,entrada,tipo_aposta,status,odd,moeda,stake_reais,stake_usd,bookie_id,esporte_id&id=in.('
                         + ','.join(ids[i:i + 100]) + ')'):
             aps[a['id']] = a
     lista = []
@@ -1478,25 +1478,37 @@ def divergencias():
     DIV['lista'], DIV['quando'] = lista, agora
     return lista
 
+ICONE_ESPORTE = {'futebol': '⚽', 'futebol feminino': '⚽', 'nba': '🏀', 'wnba': '🏀', 'basquete': '🏀', 'nhl': '🏒', 'hockey no gelo': '🏒',
+                 'nfl': '🏈', 'futebol americano': '🏈', 'mma': '🥊', 'ufc': '🥊', 'boxe': '🥊', 'tênis': '🎾', 'vôlei': '🏐', 'handebol': '🤾',
+                 'counter-strike': '🎮', 'league of legends': '🎮', 'dota 2': '🎮', 'valorant': '🎮', 'rainbow six': '🎮', 'crossfire': '🎮',
+                 'mlb': '⚾', 'beisebol': '⚾', 'rugby': '🏉', 'fórmula 1': '🏎️', 'fórmula 2': '🏎️'}
+
+def icone_esporte(a):
+    return ICONE_ESPORTE.get((esportes().get(a.get('esporte_id')) or '').strip().lower(), '🏟️')
+
 def texto_divergencias(lista):
-    """Uma linha com a aposta e outra com a marcação e o placar. None se não tem nenhuma aberta."""
+    """Um bloco por aposta, separado por linha em branco: o jogo, a entrada, e a marcação contra o placar. None se não tem nenhuma aberta."""
     if not lista:
         return None
-    fim = ['', 'Sai daqui quando a marcação no dashboard bater com o placar. Se a casa pagou do jeito que está marcado, '
-               'manda o número (#) no chat do Claude.']
-    p, postas = [f'❗ Marcadas diferente do placar · {len(lista)}', ''], 0
+    fim = ['', '✏️ Sai da lista quando a marcação no dashboard bater com o placar.',
+           '💬 Se a casa pagou do jeito que está marcado, manda o número (#) no chat do Claude.']
+    p, postas = [f'❗ Marcadas diferente do placar: {len(lista)}'], 0
     for t, a in lista:
         d = a.get('data_evento') or ''
-        cab = ' · '.join(x for x in ((f"#{t['n']}" if t.get('n') else '#?'), f'{d[8:10]}/{d[5:7]}', nome_aposta(a, valor=True)) if x)
+        odd = f" @{fl(a.get('odd')):.2f}".replace('.', ',') if a.get('odd') else ''
         ress = (t.get('ressalva') or '').strip()
-        conta = (f"↳ marcada {NOME_MARCA.get(a['status'], a['status'])}; pelo placar ({t['prova']}) é {NOME_ST.get(t['placar'], t['placar'])}"
-                 + (f'. {ress[:1].upper()}{ress[1:]}' if ress else ''))
-        if sum(len(x) + 1 for x in p + fim) + len(cab) + len(conta) + 20 > TETO_MSG:
+        bloco = ['', f"#{t.get('n') or '?'} · {d[8:10]}/{d[5:7]} · {icone_esporte(a)} {curto(a.get('evento'), 44) or 'sem evento'}",
+                 '🎯 ' + ' · '.join(x for x in (curto(a.get('entrada') or a.get('evento'), 60) + odd, stake_txt(a), casa_de(a)) if x),
+                 f"{BOLA.get(a['status'], '⏳')} Marcada {NOME_MARCA.get(a['status'], a['status'])} ➜ "
+                 f"{BOLA.get(t['placar'], '')} pelo placar ({t['prova']}) é {NOME_ST.get(t['placar'], t['placar'])}"]
+        if ress:
+            bloco.append(f'💡 {ress[:1].upper()}{ress[1:]}')
+        if sum(len(x) + 1 for x in p + bloco + fim) + 20 > TETO_MSG:
             break
-        p += [cab, conta]
+        p += bloco
         postas += 1
     if postas < len(lista):
-        p.append(f'e mais {len(lista) - postas}')
+        p += ['', f'… e mais {len(lista) - postas}']
     return '\n'.join(p + fim)
 
 def rotulo_aposta(a):

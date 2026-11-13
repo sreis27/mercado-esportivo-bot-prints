@@ -91,6 +91,7 @@ APOSTAS = [
  ap('b03', 'Futebol', 'Simples', 'Cartões', 'Brighton x Brentford', 'Under 6.5', 'PENDING', '2026-11-08', F1(a='Brighton', b='Brentford', tipo='total', met='cartoes', lado='under', linha=6.5)),
  ap('b04', 'Futebol', 'Simples', 'Resultado Final', 'Man Utd x Roma', 'Roma', 'WON', '2026-11-08', F1(a='Manchester United', b='AS Roma', tipo='1x2', lado='b')),
  ap('b05', 'Futebol', 'Simples', 'Resultado Final', 'Man Utd x Roma', 'Roma com PA', 'PENDING', '2026-11-08', F1(a='Manchester United', b='AS Roma', tipo='1x2', lado='b', regra='pa')),
+ ap('b19', 'Futebol', 'Simples', 'Resultado Final', 'Man Utd x Roma', 'Roma (sem PA)', 'PENDING', '2026-11-08', F1(a='Manchester United', b='AS Roma', tipo='1x2', lado='b', regra='sem_pa')),
  ap('b06', 'NBA', 'Simples', 'Pontos', 'Bulls x 76ers', 'Dean Wade +3.5 Pontos', 'LOST', '2026-11-08',
     [dict(esp='nba', a='Chicago Bulls', b='Philadelphia 76ers', tipo='jogador', jog='Dean Wade', met='pontos', lado='over', linha=3.5)]),
  ap('b07', 'NBA', 'Dupla', 'Múltiplos', 'Dupla', 'LeBron James Acima 20.5 Pontos + Joel Embiid 9.5+ Rebotes', 'PENDING', '2026-11-08',
@@ -168,7 +169,7 @@ esperado = {'b01': ('WON', 'apurou', True, True), 'b02': ('WON', 'conferir', Fal
             'b07': ('WON', 'apurou', True, True), 'b08': (None, 'fora', False, True), 'b09': (None, 'sem_jogo', False, False),
             'b10': (None, 'nao_terminou', False, False), 'b11': (None, 'aguarda', False, False), 'b12': (None, 'sem_jogo', False, True),
             'b15': (None, None, False, False), 'b16': ('LOST', 'conferir', False, True), 'b17': ('WON', 'apurou', True, True),
-            'b18': (None, 'nao_terminou', False, False)}
+            'b18': (None, 'nao_terminou', False, False), 'b19': ('LOST', 'apurou', True, True)}
 for i, e in esperado.items():
     l = L.get(i) or {}
     confere(f'c1 {i}', (l.get('status_proposto'), l.get('classe'), l.get('fecharia'), l.get('final')), e)
@@ -177,6 +178,7 @@ confere('c1 b05 status na hora', L['b05']['status_na_hora'], 'PENDING')
 confere('c1 b04 ressalva no motivo', 'abriu 2 gols' in (L['b04']['motivo'] or ''), True)
 confere('c1 b16 (gol contra): viu pelo placar corrido', 'abriu 2 gols' in (L['b16']['motivo'] or ''), True)
 confere('c1 b02 ressalva de folga', 'da linha' in (L['b02']['motivo'] or ''), True)
+confere('c1 b19 "sem PA" escrito: perdeu e pronto, sem a ressalva do pagamento antecipado', 'abriu 2 gols' in (L['b19']['motivo'] or ''), False)
 confere('c1 b10 próxima = início + 115 min', L['b10']['proxima_em'], '2026-11-09T20:55:00Z')
 confere('c1 b10 guardou o início', L['b10']['inicio'], '2026-11-09T19:00:00Z')
 confere('c1 b11 próxima em 30 min', L['b11']['proxima_em'], '2026-11-09T04:00:00Z')

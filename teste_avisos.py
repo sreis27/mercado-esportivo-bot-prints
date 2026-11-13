@@ -252,12 +252,14 @@ saiu = TG[antes:]
 confere('fechamento: às 7h sai uma mensagem nova, com som, e a lista das marcadas diferente logo depois, sem som',
         ([x[0] for x in saiu], saiu[0][1].get('disable_notification'), saiu[1][1].get('disable_notification')), (['sendMessage', 'sendMessage'], False, True))
 print('--- marcadas diferente do placar às 7h:'); print(saiu[1][1]['text'])
-confere('lista: texto das 7h', saiu[1][1]['text'], """❗ Marcadas diferente do placar · 1
+confere('lista: texto das 7h', saiu[1][1]['text'], """❗ Marcadas diferente do placar: 1
 
-#1 · 09/11 · Time X x Time Y · Time X @2,00 · R$ 500,00
-↳ marcada red; pelo placar (1x0) é green
+#1 · 09/11 · ⚽ Time X x Time Y
+🎯 Time X @2,00 · R$ 500,00
+🔴 Marcada red ➜ 🟢 pelo placar (1x0) é green
 
-Sai daqui quando a marcação no dashboard bater com o placar. Se a casa pagou do jeito que está marcado, manda o número (#) no chat do Claude.""")
+✏️ Sai da lista quando a marcação no dashboard bater com o placar.
+💬 Se a casa pagou do jeito que está marcado, manda o número (#) no chat do Claude.""")
 print('--- fechamento às 7h:'); print(saiu[0][1]['text'])
 confere('fechamento: texto das 7h', saiu[0][1]['text'], '''☀️ Fechamento de ontem · seg 09/11
 
@@ -310,12 +312,15 @@ confere('fechamento: texto depois das baixas', saiu[0][1]['text'], '''☀️ Fec
 📌 De dias anteriores, ainda sem baixa (1)
 • 05/11 · Dupla: Time Velho + Outro Velho @3,00 · Polymarket · ''' + m.situacao(TABELA.get('a7') or {}, RELOGIO[0].astimezone(m.BRT))[1])
 print('--- lista depois das baixas:'); print(saiu[1][1]['text'])
-confere('lista: a da sombra entra com o número seguinte, com a conta do robô', saiu[1][1]['text'].split('\n\nSai daqui')[0], """❗ Marcadas diferente do placar · 2
+confere('lista: a da sombra entra com o número seguinte, com a conta do robô', saiu[1][1]['text'].split('\n\n✏️')[0], """❗ Marcadas diferente do placar: 2
 
-#1 · 09/11 · Time X x Time Y · Time X @2,00 · R$ 500,00
-↳ marcada red; pelo placar (1x0) é green
-#2 · 09/11 · Lazio x Napoli · Lazio @2,10 · US$ 50,00 · Polymarket
-↳ marcada red; pelo placar (Lazio 2x1 Napoli) é green""")
+#1 · 09/11 · ⚽ Time X x Time Y
+🎯 Time X @2,00 · R$ 500,00
+🔴 Marcada red ➜ 🟢 pelo placar (1x0) é green
+
+#2 · 09/11 · ⚽ Lazio x Napoli
+🎯 Lazio @2,10 · US$ 50,00 · Polymarket
+🔴 Marcada red ➜ 🟢 pelo placar (Lazio 2x1 Napoli) é green""")
 confere('lista: gravou a nova na tabela', (DIVT['a2']['n'], DIVT['a2']['origem'], DIVT['a2']['placar']), (2, 'sombra', 'WON'))
 # corrigem a #1 no dashboard: sai da lista em até 5 min
 for a in APOSTAS:
