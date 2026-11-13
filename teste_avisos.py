@@ -155,6 +155,13 @@ confere('ligado: resultado responde a mensagem do jogo e avisa', (fim[1][1].get(
 confere('ligado: depois do fim, silêncio', n6 - n5, 0)
 confere('ligado: estado guardado', sorted(AVISOS_T), ['jogo:futebol:e7', 'jogo:futebol:e7:fim', 'painel:2026-11-09'])
 confere('ligado: jogo fechado no estado', AVISOS_T['jogo:futebol:e7']['estado'], 'fim')
+# de madrugada o resultado chega sem som
+RELOGIO[0] = datetime(2026, 11, 10, 2, 30, tzinfo=timezone.utc)      # 23h30 em Brasília
+antes = len(TG)
+m.av_manda('teste:noite', 'Fim · teste', 'fim', novo=True, avisa=True)
+confere('de noite: resultado sem som', (len(TG) - antes, TG[-1][1].get('disable_notification')), (1, True))
+m.MEM.pop('teste:noite', None); AVISOS_T.pop('teste:noite', None)
+RELOGIO[0] = datetime(2026, 11, 9, 20, 52, tzinfo=timezone.utc)
 # reinício do serviço: não manda nada de novo
 m.MEM.clear(); m.MEM_OK[0] = False
 antes = len(TG)

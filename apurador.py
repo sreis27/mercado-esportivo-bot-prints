@@ -1155,6 +1155,11 @@ SEMANA = ('seg', 'ter', 'qua', 'qui', 'sex', 'sáb', 'dom')
 def tg_vivo():
     return bool(TG_TOKEN and TG_CHAT) and (TG_MODO == 'ligado' or (TG_MODO == 'ensaio' and TG_DESDE is not None and agora_utc() >= TG_DESDE))
 
+def silencio():
+    """Das 23h às 8h (Brasília) nenhuma mensagem toca; o resultado chega do mesmo jeito, sem som."""
+    h = agora_utc().astimezone(BRT).hour
+    return h >= 23 or h < 8
+
 def tg(metodo, **campos):
     """Chamada ao Telegram. O erro nunca carrega o endereço (que tem o token)."""
     try:
@@ -1215,7 +1220,7 @@ def av_manda(chave, texto, estado, novo=False, avisa=False, responde=None):
         if len(ENVIOS) >= TETO_HORA:
             log('TRAVA: passou de', TETO_HORA, 'mensagens novas em 1h; não mandei', chave)
             return False
-        campos = {'chat_id': TG_CHAT, 'text': texto, 'disable_notification': not avisa}
+        campos = {'chat_id': TG_CHAT, 'text': texto, 'disable_notification': not (avisa and not silencio())}
         if responde and responde > 0:
             campos['reply_to_message_id'] = responde
             campos['allow_sending_without_reply'] = True
