@@ -909,7 +909,7 @@ def sb_todos(path):
         off += 1000
 
 def sb_grava(linhas):
-    """Escrita do robô: só nas tabelas dele (apuracoes aqui, apuracao_avisos nos avisos). Não existe escrita em apostas neste arquivo."""
+    """Escrita do robô: só nas tabelas dele (apuracoes aqui; apuracao_avisos e apuracao_divergencias nos avisos). Não existe escrita em apostas neste arquivo."""
     for i in range(0, len(linhas), 200):
         r = requests.post(f'{SB_URL}/rest/v1/apuracoes?on_conflict=aposta_id',
                           headers=_cab({'Prefer': 'resolution=merge-duplicates,return=minimal'}),
@@ -1208,8 +1208,9 @@ def av_carrega():
         return
     MEM.clear()
     desde = iso(agora_utc() - timedelta(days=3))
-    for l in sb_get(f'apuracao_avisos?select=chave,msg_id,texto,estado,atualizado_em&atualizado_em=gte.{desde}&chat_id=eq.{TG_CHAT}'):
-        MEM[l['chave']] = {'msg_id': l.get('msg_id'), 'texto': l.get('texto'), 'estado': l.get('estado'), 'quando': de_iso(l.get('atualizado_em'))}
+    for l in sb_get(f'apuracao_avisos?select=chave,msg_id,texto,estado,dados,atualizado_em&atualizado_em=gte.{desde}&chat_id=eq.{TG_CHAT}'):
+        MEM[l['chave']] = {'msg_id': l.get('msg_id'), 'texto': l.get('texto'), 'estado': l.get('estado'), 'quando': de_iso(l.get('atualizado_em')),
+                           'fixado': bool((l.get('dados') or {}).get('fixado'))}
     MEM_OK[0] = True
 
 def av_guarda(chave, **campos):
@@ -1221,7 +1222,8 @@ def av_guarda(chave, **campos):
             r = requests.post(f'{SB_URL}/rest/v1/apuracao_avisos?on_conflict=chave',
                               headers=_cab({'Prefer': 'resolution=merge-duplicates,return=minimal'}),
                               data=json.dumps([{'chave': chave, 'chat_id': int(TG_CHAT), 'msg_id': e['msg_id'], 'texto': e['texto'],
-                                                'estado': e['estado'], 'atualizado_em': iso(e['quando'])}], ensure_ascii=False).encode('utf-8'), timeout=30)
+                                                'estado': e['estado'], 'dados': ({'fixado': True} if e.get('fixado') else None),
+                                                'atualizado_em': iso(e['quando'])}], ensure_ascii=False).encode('utf-8'), timeout=30)
             r.raise_for_status()
         except Exception as ex:
             log('ERRO ao guardar aviso', chave, type(ex).__name__)
@@ -1299,11 +1301,11 @@ ESPERA = {'sem_jogo': 'ainda procurando o jogo', 'nao_terminou': 'esperando o fi
 MULTI = ('dupla', 'tripla', 'multipla', 'múltipla', 'combinada')
 TETO_MSG = 3800     # o Telegram aceita 4096 por mensagem
 
-def nome_aposta(a):
-    """Evento, entrada, odd e casa numa linha curta."""
+def nome_aposta(a, valor=False):
+    """Evento, entrada, odd e casa numa linha curta; com valor=True, o valor apostado (R$ ou US$) antes da casa."""
     ev, en = curto(a.get('evento'), 36), curto(a.get('entrada'), 48)
     odd = f" @{fl(a.get('odd')):.2f}".replace('.', ',') if a.get('odd') else ''
-    casa = casa_de(a)
+    casa = ' · '.join(x for x in ((stake_txt(a) if valor else ''), casa_de(a)) if x)
     casa = f' · {casa}' if casa else ''
     if not en or en.lower() == ev.lower():
         return ev + odd + casa
@@ -1351,14 +1353,14 @@ def junta_secoes(p, secoes, fim=()):
 
 def texto_fechamento(ontem, brt, aps, linhas):
     """O fechamento do dia anterior: como está, o que revisar e quantas faltam dar baixa. None se não há o que dizer."""
-    do = [a for a in aps if a['data_evento'] == str(ontem)]
+    do = sorted((a for a in aps if a['data_evento'] == str(ontem)), key=lambda a: ((a.get('evento') or '').lower(), (a.get('entrada') or '').lower(), a['id']))
     velhas = sorted((a for a in aps if a['data_evento'] < str(ontem) and a['status'] == 'PENDING'), key=lambda a: (a['data_evento'], a['id']))
     if not do and not velhas:
         return None
     mapa = esportes()
     t = {'u': 0.0, 'BRL': 0.0, 'USD': 0.0, 'lu': 0.0, 'lBRL': 0.0, 'lUSD': 0.0, 'ru': 0.0, 'rBRL': 0.0, 'rUSD': 0.0}
     baixa, falta, cont = 0, 0, {'WON': 0, 'LOST': 0, 'VOID': 0}
-    diferentes, revisar, na_mao, esperando = [], [], [], []
+    revisar, na_mao, esperando = [], [], []
     for a in do:
         m = 'USD' if a.get('moeda') == 'USD' else 'BRL'
         t['u'] += fl(a.get('stake_unidades'))
@@ -1366,13 +1368,10 @@ def texto_fechamento(ontem, brt, aps, linhas):
         l = linhas.get(a['id']) or {}
         st = l.get('status_proposto')
         nome = nome_aposta(a)
-        if a['status'] != 'PENDING':
+        if a['status'] != 'PENDING':                    # marcada diferente do robô: vai pra lista das marcadas diferente do placar
             baixa += 1
             t['lu'] += fl(a.get('lucro_unidades'))
             t['l' + m] += fl(a.get('lucro_usd')) if m == 'USD' else fl(a.get('lucro_reais'))
-            if st and a['status'] != 'CASH OUT' and a['status'] != st:
-                diferentes.append(f"• {nome} · marcada {NOME_ST.get(a['status'], a['status'])}, robô {NOME_ST.get(st, st)}"
-                                  + (' (com ressalva)' if l.get('classe') == 'conferir' else ''))
             continue
         falta += 1
         tipo, txt = situacao(l, brt)
@@ -1384,9 +1383,11 @@ def texto_fechamento(ontem, brt, aps, linhas):
         if tipo == 'revisar':
             revisar.append(f'• {nome} · {txt}')
         elif tipo == 'mao':
-            na_mao.append(f"• {mapa.get(a.get('esporte_id')) or 'sem esporte'} · {nome}" + (f' · {txt}' if txt else ''))
+            esporte = mapa.get(a.get('esporte_id')) or 'sem esporte'
+            na_mao.append((esporte.lower(), f'• {esporte} · {nome}' + (f' · {txt}' if txt else '')))
         elif tipo == 'espera':
             esperando.append(f'• {nome} · {txt}')
+    na_mao = [x for _, x in sorted(na_mao, key=lambda x: x[0])]
     apur = sum(cont.values())
     p = [f"☀️ Fechamento de ontem · {SEMANA[ontem.weekday()]} {ontem.strftime('%d/%m')}", '']
     if do:
@@ -1404,11 +1405,99 @@ def texto_fechamento(ontem, brt, aps, linhas):
     for a in velhas:
         tipo, txt = situacao(linhas.get(a['id']) or {}, brt)
         antigas.append(f"• {a['data_evento'][8:10]}/{a['data_evento'][5:7]} · {nome_aposta(a)} · {txt or 'sem apuração automática'}")
-    return '\n'.join(junta_secoes(p, ((f'❗ Marcadas diferente do robô ({len(diferentes)})', diferentes),
-                                      (f'⚠️ Pra revisar ({len(revisar)})', revisar),
+    return '\n'.join(junta_secoes(p, ((f'⚠️ Pra revisar ({len(revisar)})', revisar),
                                       (f'✋ Sem apuração automática, baixa na mão ({len(na_mao)})', na_mao),
                                       (f'🕒 Ainda sem resultado ({len(esperando)})', esperando),
                                       (f'📌 De dias anteriores, ainda sem baixa ({len(antigas)})', antigas))))
+
+NOME_MARCA = dict(NOME_ST, PENDING='pendente')
+SOMBRA_DESDE = datetime(2026, 11, 12, tzinfo=timezone.utc)      # o robô propõe desde 12/11
+DIV = {'quando': None, 'lista': None}                           # a lista aberta, relida a cada 5 min
+
+def prova_curta(motivo):
+    """A conta do robô sem o código do status: 'Sandefjord 5x5 Molde [FULL_TIME 2026-11-08] reg 5-5' -> 'Sandefjord 5x5 Molde'."""
+    s = re.sub(r'\s*\[[^\]]*\]', '', motivo or '')
+    s = re.sub(r'(\d+)x(\d+)(.*?) reg \1-\2\b', r'\1x\2\3', s)
+    s = s.replace(' || ', ' / ').replace('=', ' ')
+    return curto(re.sub(r'\s+', ' ', s).strip(), 110)
+
+def divergencias():
+    """As apostas marcadas diferente do placar que seguem abertas: [(linha de apuracao_divergencias, aposta)], pelo número.
+    Acrescenta as que a sombra achou e tira as que passaram a bater. Só grava em modo ligado; em ensaio fica na memória."""
+    agora = agora_utc()
+    if DIV['lista'] is not None and agora - DIV['quando'] < timedelta(minutes=5):
+        return DIV['lista']
+    vivo = tg_vivo()
+    campos = 'apuracao_divergencias?select=n,aposta_id,placar,prova,ressalva,situacao&order=n.asc'
+    tab = sb_get(campos)
+    tem = {t['aposta_id'] for t in tab}
+    desde = max(SOMBRA_DESDE, agora - timedelta(days=45))
+    props = sb_todos(f'apuracoes?select=aposta_id,status_proposto,motivo&status_proposto=not.is.null&proposto_em=gte.{iso(desde)}&order=aposta_id.asc')
+    props = [p for p in props if p['aposta_id'] not in tem and p['aposta_id'] not in PULAR]
+    marca = {}
+    ids = [p['aposta_id'] for p in props]
+    for i in range(0, len(ids), 100):
+        for a in sb_get('apostas?select=id,status&id=in.(' + ','.join(ids[i:i + 100]) + ')'):
+            marca[a['id']] = a['status']
+    novas = []
+    for p in props:
+        st = marca.get(p['aposta_id'])
+        if st in (None, 'PENDING', 'CASH OUT') or st == p['status_proposto']:
+            continue
+        prova, _, ress = (p.get('motivo') or '').partition(' | ressalva: ')
+        novas.append({'aposta_id': p['aposta_id'], 'placar': p['status_proposto'], 'prova': prova_curta(prova) or 'conta do robô',
+                      'ressalva': ress.strip() or None, 'origem': 'sombra'})
+    if novas and vivo:
+        r = requests.post(f'{SB_URL}/rest/v1/apuracao_divergencias', headers=_cab({'Prefer': 'resolution=ignore-duplicates,return=minimal'}),
+                          data=json.dumps(novas, ensure_ascii=False).encode('utf-8'), timeout=30)
+        r.raise_for_status()
+        log('marcadas diferente do placar, novas da sombra:', len(novas))
+        tab = sb_get(campos)
+    elif novas:
+        tab = tab + [dict(x, n=None, situacao='aberta') for x in novas]
+    abertas = [t for t in tab if t.get('situacao') == 'aberta']
+    aps = {}
+    ids = [t['aposta_id'] for t in abertas]
+    for i in range(0, len(ids), 100):
+        for a in sb_get('apostas?select=id,data_evento,evento,entrada,tipo_aposta,status,odd,moeda,stake_reais,stake_usd,bookie_id&id=in.('
+                        + ','.join(ids[i:i + 100]) + ')'):
+            aps[a['id']] = a
+    lista = []
+    for t in abertas:
+        a = aps.get(t['aposta_id'])
+        if not a:
+            continue
+        if a['status'] in (t['placar'], 'CASH OUT'):                 # a marcação passou a bater com o placar: sai da lista
+            if vivo and t.get('n'):
+                r = requests.patch(f"{SB_URL}/rest/v1/apuracao_divergencias?aposta_id=eq.{t['aposta_id']}", headers=_cab({'Prefer': 'return=minimal'}),
+                                   data=json.dumps({'situacao': 'corrigida', 'resolvida_em': iso(agora)}).encode('utf-8'), timeout=30)
+                r.raise_for_status()
+                log(f"marcada diferente do placar #{t['n']}: a marcação passou a bater, saiu da lista")
+            continue
+        lista.append((t, a))
+    DIV['lista'], DIV['quando'] = lista, agora
+    return lista
+
+def texto_divergencias(lista):
+    """Uma linha com a aposta e outra com a marcação e o placar. None se não tem nenhuma aberta."""
+    if not lista:
+        return None
+    fim = ['', 'Sai daqui quando a marcação no dashboard bater com o placar. Se a casa pagou do jeito que está marcado, '
+               'manda o número (#) no chat do Claude.']
+    p, postas = [f'❗ Marcadas diferente do placar · {len(lista)}', ''], 0
+    for t, a in lista:
+        d = a.get('data_evento') or ''
+        cab = ' · '.join(x for x in ((f"#{t['n']}" if t.get('n') else '#?'), f'{d[8:10]}/{d[5:7]}', nome_aposta(a, valor=True)) if x)
+        ress = (t.get('ressalva') or '').strip()
+        conta = (f"↳ marcada {NOME_MARCA.get(a['status'], a['status'])}; pelo placar ({t['prova']}) é {NOME_ST.get(t['placar'], t['placar'])}"
+                 + (f'. {ress[:1].upper()}{ress[1:]}' if ress else ''))
+        if sum(len(x) + 1 for x in p + fim) + len(cab) + len(conta) + 20 > TETO_MSG:
+            break
+        p += [cab, conta]
+        postas += 1
+    if postas < len(lista):
+        p.append(f'e mais {len(lista) - postas}')
+    return '\n'.join(p + fim)
 
 def rotulo_aposta(a):
     tipo = (a.get('tipo_aposta') or '').strip()
@@ -1611,7 +1700,13 @@ def avisos():
             e['tentou_fixar'] = time.time()                           # tenta fixar; se o bot não tem permissão, tenta de novo em meia hora
             try:
                 tg('pinChatMessage', chat_id=TG_CHAT, message_id=e['msg_id'], disable_notification=True)
-                e['fixado'] = True
+                av_guarda(chave, fixado=True)
+                velho = MEM.get(f'painel:{dia - timedelta(days=1)}') or {}
+                if velho.get('msg_id') and velho['msg_id'] > 0:       # o painel de ontem sai do alto do grupo
+                    try:
+                        tg('unpinChatMessage', chat_id=TG_CHAT, message_id=velho['msg_id'])
+                    except Exception as ex:
+                        log('aviso: não consegui desafixar o painel de ontem:', str(ex)[:160])
             except Exception as ex:
                 log('aviso: não consegui fixar o painel:', str(ex)[:160])
 
@@ -1626,6 +1721,23 @@ def avisos():
                 av_manda(chave, txt, 'fechamento', novo=True, avisa=True)
             elif txt:
                 av_manda(chave, txt, 'fechamento')
+
+    # marcadas diferente do placar: uma vez por dia, logo depois do fechamento e sem som; corrigida no lugar quando alguma sai da lista
+    if brt.hour >= 7:
+        chave = f'divergencias:{brt.date()}'
+        e = MEM.get(chave) or {}
+        if e.get('msg_id') or brt.hour < 12:
+            try:
+                txt = texto_divergencias(divergencias())
+            except Exception:
+                txt = False
+                log('ERRO na lista das marcadas diferente do placar:', traceback.format_exc()[-400:].replace('\n', ' / '))
+            if txt and not e.get('msg_id'):
+                av_manda(chave, txt, 'divergencias', novo=True)
+            elif txt:
+                av_manda(chave, txt, 'divergencias')
+            elif txt is None and e.get('msg_id'):
+                av_manda(chave, '✅ Marcadas diferente do placar: nenhuma. Todas batem.', 'divergencias')
 
 
 

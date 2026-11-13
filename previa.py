@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 def nada(*a, **k):
     raise RuntimeError('a prévia não escreve')
 m.requests.post = nada
+m.requests.patch = nada
 m.tg = nada
 print('P| modo', m.TG_MODO, '| manda de verdade?', m.tg_vivo(), flush=True)
 
@@ -23,6 +24,8 @@ def rodada(nome, quando=None):
         print('P| ERRO', traceback.format_exc()[-1500:].replace('\n', ' / '), flush=True)
 
 rodada('agora: painel de hoje + fechamento de ontem')
+print('P| fim', flush=True)
+sys.exit(0)
 rodada('ontem 17h: como saem os jogos de ontem', datetime(2026, 11, 12, 20, 0, tzinfo=timezone.utc))
 rodada('amanha 7h01: fechamento de hoje do jeito que esta agora', datetime(2026, 11, 14, 10, 1, tzinfo=timezone.utc))
 print('P| fim', flush=True)
