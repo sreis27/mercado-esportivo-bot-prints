@@ -1342,7 +1342,8 @@ def avisos():
             vivos.append(j)
             txt = f"{placar_txt(j)} · {x.get('detalhe') or 'ao vivo'}\n" + '\n'.join(linha_aposta(a, l, False) for a, l in lista)
             if e.get('estado') in (None, 'pre'):
-                av_manda(chave, 'Começou · ' + txt, 'vivo', novo=not e.get('msg_id'))
+                comeco = 'Começou · ' if agora - j['inicio'] < timedelta(minutes=15) else 'Ao vivo · '     # pegou o jogo andando
+                av_manda(chave, comeco + txt, 'vivo', novo=not e.get('msg_id'))
             elif e.get('estado') == 'vivo':
                 av_manda(chave, txt, 'vivo')
             continue
@@ -1410,7 +1411,9 @@ def avisos():
             p.append('')
             p.append('A seguir')
             for j in seguir[:10]:
-                p.append(f"{hora_brt(j['inicio'])} {j['casa']} x {j['fora']} · {len(j['apostas'])} " + ('entrada' if len(j['apostas']) == 1 else 'entradas'))
+                quando = j['inicio'].astimezone(BRT)
+                outro_dia = '' if quando.date() == brt.date() else SEMANA[quando.weekday()] + ' '
+                p.append(f"{outro_dia}{hora_brt(j['inicio'])} {j['casa']} x {j['fora']} · {len(j['apostas'])} " + ('entrada' if len(j['apostas']) == 1 else 'entradas'))
             if len(seguir) > 10:
                 p.append(f'e mais {len(seguir) - 10}')
         texto = '\n'.join(p)
