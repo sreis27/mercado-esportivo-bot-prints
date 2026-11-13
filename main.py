@@ -1439,6 +1439,31 @@ def _fmt_data_br(s):
 def _erro_curto(e):
     return (str(e).split(' for url')[0].strip() or e.__class__.__name__)[:80]
 
+# ============================================================
+# PAGAMENTO ANTECIPADO (PA) — o operador escreve "com PA" ou "sem PA" na legenda
+# ============================================================
+# É a regra da casa de pagar como green quando o time abre 2 gols de vantagem.
+# Vai escrita na entrada, "(com PA)" ou "(sem PA)", pra quem dá a baixa saber
+# (o robô apurador lê daí). "PA" aqui nunca é conta nem nome.
+RE_PA = re.compile(r'(?<![\w/])(com|sem|c/|s/)\s*(?:o\s+)?(?:p\.?\s?a\.?|pagamento\s+antecipado)(?!\w)', re.IGNORECASE)
+RE_PA_NA_ENTRADA = re.compile(r'\bp\.?\s?a\b|antecipad', re.IGNORECASE)
+
+def regra_pa(texto):
+    """'com', 'sem' ou None, pelo que o operador escreveu. Vale a última menção (a correção vem depois da legenda)."""
+    achados = [m.group(1).lower() for m in RE_PA.finditer(texto or '')]
+    if not achados:
+        return None
+    return 'sem' if achados[-1] in ('sem', 's/') else 'com'
+
+def aplicar_pa(ap, pa):
+    """Escreve a regra na entrada e desfaz o 'PA' lido como conta."""
+    ent = (ap.get('entrada') or '').strip()
+    if ent and not RE_PA_NA_ENTRADA.search(ent):
+        ap['entrada'] = f"{ent} ({pa} PA)"
+    cu = ap.get('contas_utilizadas')
+    if isinstance(cu, str) and re.fullmatch(r'\s*p\.?\s?a\.?\s*', cu, re.IGNORECASE):
+        ap['contas_utilizadas'] = None
+
 def registrar_apostas(resultado, tg_msg_id, cadastros, data_hoje, texto_data, texto_bookie, criado_por=None,
                       texto_tipster=''):
     """Grava as apostas extraídas e devolve o relatório: o que entrou (com avisos/dúvidas) e o que falhou.
@@ -1451,10 +1476,16 @@ def registrar_apostas(resultado, tg_msg_id, cadastros, data_hoje, texto_data, te
         rel['duvida_geral'] = dg.strip()[:140] if isinstance(dg, str) and dg.strip() else None
         return rel
     odd_do_operador = bool(RE_ODD_OPERADOR.search(texto_data or ''))
+    pa = regra_pa(texto_data)
+    if pa:
+        print(f"  💰 Pagamento antecipado na legenda: {pa} PA", flush=True)
     for ap in apostas:
         duvidas = limpar_duvidas(ap.get('duvidas'))
         if odd_do_operador:   # R8: odd da legenda é a que ele pegou — diferença pro print não é dúvida
             duvidas = [d for d in duvidas if not d.lower().startswith('odd')]
+        if pa:                # "com PA"/"sem PA" é a regra do pagamento antecipado: vai na entrada, não é dúvida de conta
+            aplicar_pa(ap, pa)
+            duvidas = [d for d in duvidas if not re.search(r'\bp\.?\s?a\b', d, re.IGNORECASE)]
         try:
             ap['data_evento'] = ap.get('data_evento') or data_hoje
             if (ap.get('status') or '').upper() not in STATUS_VALIDOS:
