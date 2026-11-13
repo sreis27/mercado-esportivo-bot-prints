@@ -167,7 +167,7 @@ RELOGIO[0] = datetime(2026, 11, 9, 20, 52, tzinfo=timezone.utc)
 m.MEM.clear(); m.MEM_OK[0] = False
 antes = len(TG)
 roda(m.avisos)
-confere('reinício: nada repetido', len(TG) - antes, 0)
+confere('reinício: nenhuma mensagem repetida (só tenta fixar o painel de novo)', [x[0] for x in TG[antes:]], ['pinChatMessage'])
 # erro do Telegram não vaza o token
 def post_ruim(url, **k): raise ConnectionError('falhou em ' + url)
 m.requests.post = post_ruim

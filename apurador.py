@@ -1421,13 +1421,17 @@ def avisos():
         e = MEM.get(chave) or {}
         sem_hora = lambda s: '\n'.join((s or '').split('\n')[1:])
         if not e.get('msg_id'):
-            if av_manda(chave, texto, 'painel', novo=True) and tg_vivo():
-                try:
-                    tg('pinChatMessage', chat_id=TG_CHAT, message_id=MEM[chave]['msg_id'], disable_notification=True)
-                except Exception as ex:
-                    log('aviso: não consegui fixar o painel:', str(ex)[:160])
+            av_manda(chave, texto, 'painel', novo=True)
         elif sem_hora(e.get('texto')) != sem_hora(texto):            # só edita quando muda algo além da hora
             av_manda(chave, texto, 'painel')
+        e = MEM.get(chave) or {}
+        if tg_vivo() and e.get('msg_id') and e['msg_id'] > 0 and not e.get('fixado') and time.time() - (e.get('tentou_fixar') or 0) > 1800:
+            e['tentou_fixar'] = time.time()                           # tenta fixar; se o bot não tem permissão, tenta de novo em meia hora
+            try:
+                tg('pinChatMessage', chat_id=TG_CHAT, message_id=e['msg_id'], disable_notification=True)
+                e['fixado'] = True
+            except Exception as ex:
+                log('aviso: não consegui fixar o painel:', str(ex)[:160])
 
 
 
