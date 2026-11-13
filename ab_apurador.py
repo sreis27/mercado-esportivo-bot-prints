@@ -168,6 +168,9 @@ CONVENÇÕES DO TEXTO
 - Vírgula decimal vale como ponto ("6,5" = 6.5).
 - Se a entrada cita um time e um total ("Kilmarnock Over 0.5" no mercado Gols), é total daquele time.
 - Mercado diz handicap mas a entrada não tem linha nenhuma (só o nome do time, ou "Time com PA"): leia como "1x2" e explique em "duvida".
+- Não use o que você lembra de elenco: jogador troca de time. Não ponha dúvida por achar que o jogador não é de nenhum dos times do evento.
+- O "esporte" informado pode estar errado. Se os times não combinam com ele (ex.: clubes de basquete da Euroliga ou do NBB marcados como Futebol), use o esporte certo e explique em "duvida".
+- Em luta, se a perna cita só um lutador, ponha esse lutador em "a".
 
 EXEMPLOS
 Entrada:
@@ -264,11 +267,19 @@ def inteiro(v):
     except Exception:
         return None
 
+VISTO_MMA = [0]
+
 def normaliza(esp, e, d_espn):
     out = []
     comps = e.get('competitions') or []
     if esp != 'mma':
         comps = comps[:1]
+    elif comps and VISTO_MMA[0] < 2:
+        VISTO_MMA[0] += 1
+        c0 = comps[-1]
+        log('M|' + json.dumps({'chaves': sorted(c0.keys()), 'status': c0.get('status'), 'type': c0.get('type'),
+                               'comp0': {k: v for k, v in (c0.get('competitors') or [{}])[0].items() if k not in ('athlete', 'links')},
+                               'details': (c0.get('details') or [])[:2]}, ensure_ascii=False)[:1500])
     for c in comps:
         try:
             cs = c.get('competitors') or []
@@ -407,7 +418,7 @@ def acha_jogo(p, D, fem):
             n = a or b
             s0, s1 = sim_time(n, t0), sim_time(n, t1)
             s, ix = (s0, 0) if s0 >= s1 else (s1, 1)
-            if s >= 0.9:
+            if s >= 0.9 and prioridade(j, D) <= 1:      # um time só é prova fraca: só vale jogo do próprio dia
                 achados.append((prioridade(j, D), -s, j, ix if a else 1 - ix))
     if not achados:
         return None, None, 'sem_jogo'
