@@ -15,14 +15,14 @@ SB_KEY = os.environ.get('SUPABASE_KEY', '')
 MODELO = os.environ.get('MODELO_FICHA', 'claude-sonnet-5-5')
 DE = os.environ.get('AP_DE', '2026-11-05')
 ATE = os.environ.get('AP_ATE', '2026-11-11')
-MAXIMO = int(os.environ.get('AP_MAX', '70') or 0)      # 1ª rodada: amostra pequena, pra conferir o encanamento
+MAXIMO = int(os.environ.get('AP_MAX', '0') or 0)
 LOTE = 12
 BRT = timezone(timedelta(hours=-3))
 ESPN = 'https://site.api.espn.com/apis/site/v2/sports'
 CAM = {'futebol': 'soccer/all', 'nba': 'basketball/nba', 'nhl': 'hockey/nhl', 'nfl': 'football/nfl', 'mma': 'mma/ufc'}
 ROTULO = {'Futebol': 'futebol', 'Futebol Feminino': 'futebol', 'NBA': 'nba', 'NHL': 'nhl', 'NFL': 'nfl',
           'MMA': 'mma', 'UFC': 'mma', '(sem esporte)': None}
-USO = {'ficha': [0, 0, 0], 'casa': [0, 0, 0]}   # entrada, saída, chamadas
+USO = {'ficha': [0, 0, 0, 0, 0], 'casa': [0, 0, 0, 0, 0]}   # entrada nova, saída, chamadas, cache lido, cache escrito
 N_REQ = [0]
 
 
@@ -119,9 +119,10 @@ def pergunta(cli, sistema, conteudo, max_tokens, uso):
         messages=[{'role': 'user', 'content': conteudo}])
     u = getattr(resp, 'usage', None)
     if u is not None:
-        USO[uso][0] += (getattr(u, 'input_tokens', 0) or 0) + (getattr(u, 'cache_read_input_tokens', 0) or 0) \
-            + (getattr(u, 'cache_creation_input_tokens', 0) or 0)
+        USO[uso][0] += getattr(u, 'input_tokens', 0) or 0
         USO[uso][1] += getattr(u, 'output_tokens', 0) or 0
+        USO[uso][3] += getattr(u, 'cache_read_input_tokens', 0) or 0
+        USO[uso][4] += getattr(u, 'cache_creation_input_tokens', 0) or 0
     USO[uso][2] += 1
     return ''.join(getattr(b, 'text', '') or '' for b in (getattr(resp, 'content', None) or [])
                    if getattr(b, 'type', '') == 'text')
@@ -296,7 +297,7 @@ def normaliza(esp, e, d_espn):
                 continue
             utc = datetime(*[int(g) for g in m.groups()], tzinfo=timezone.utc)
             out.append({'esp': esp, 'id': str(c.get('id') or e.get('id')), 'ev_id': str(e.get('id')),
-                        'liga': (e.get('season') or {}).get('slug') or '', 'utc': utc,
+                        'liga': ' '.join(x for x in ((e.get('season') or {}).get('slug'), c.get('altGameNote')) if x), 'utc': utc,
                         'dia_brt': utc.astimezone(BRT).date(), 'dia_espn': d_espn,
                         'status': tipo.get('name') or '', 'completo': bool(tipo.get('completed')),
                         'times': times, 'detalhes': c.get('details') or []})
@@ -361,7 +362,7 @@ def resumo(jogo):
         time.sleep(0.12)
     return RESUMOS[k]
 
-RE_FEM = re.compile(r'women|nwsl|femen|femin|frauen|damall|liga-f|wsl|she-?believes', re.I)
+RE_FEM = re.compile(r'women|nwsl|femen|femin|frauen|damen|dames|vrouwen|kvinn|ladies|damall|liga-f|wsl|she-?believes', re.I)
 
 def eh_fem(j):
     return bool(RE_FEM.search(j.get('liga') or ''))
@@ -464,7 +465,7 @@ def casa_pelo_modelo(cli, pendentes):
 
     def um(item):
         (esp, D), itens = item
-        cands = candidatos(esp, D)
+        cands = [j for j in candidatos(esp, D) if prioridade(j, D) <= 1]
         if not cands:
             return {}
         porid = {j['id']: j for j in cands}
@@ -844,6 +845,9 @@ def main():
                     j, ia, motivo = acha_jogo(p, a['D'], fem_ap or bool(p.get('fem')))
                     if j:
                         casados[(a['n'], k)] = (j, ia, 'nome')
+                    elif p.get('tipo') == 'jogador' and p.get('jog') and p['esp'] in ('nba', 'nhl', 'nfl'):
+                        j, ia, motivo = acha_jogo_do_jogador(p, a['D'])
+                        casados[(a['n'], k)] = (j, ia, 'jogador_outro_jogo') if j else (None, None, motivo)
                     else:
                         pendentes.append(((a['n'], k), p, a, a['D']))
                 elif p.get('tipo') == 'jogador' and p.get('jog'):
@@ -928,7 +932,7 @@ def main():
     for a in linhas:
         marca = '-' if not a['robo'] else ('ok' if a['robo'] == a['status'] else 'DIF')
         log('B|' + '|'.join(str(x) for x in (
-            a['n'], a['data_evento'], a['esporte'], a.get('tipo_aposta') or '', curto(a.get('mercado'), 26), a['status'],
+            a['n'], a['data_evento'], a['esporte'], a.get('tipo_aposta') or '', curto(a.get('mercado'), 26) + ' @' + str(a.get('odd')), a['status'],
             a['robo'] or '-', marca, a['classe'] or '', 'duvida' if a['duvida'] else '', a['como'],
             curto(a.get('evento'), 44) + ' ~ ' + curto(a.get('entrada'), 90), curto(a['txt'], 260))))
     for a in linhas:
@@ -940,7 +944,12 @@ def main():
     for r in RESUMOS.values():
         if r:
             fontes[str(r.get('fonte_box'))] = fontes.get(str(r.get('fonte_box')), 0) + 1
-    log(f"R|uso do modelo: fichas {USO['ficha'][2]} chamadas, {USO['ficha'][0]} entrada, {USO['ficha'][1]} saída | casar {USO['casa'][2]} chamadas, {USO['casa'][0]} entrada, {USO['casa'][1]} saída")
+    for k in ('ficha', 'casa'):
+        u = USO[k]
+        log(f'R|uso do modelo ({k}): {u[2]} chamadas | entrada nova {u[0]} | cache lido {u[3]} | cache escrito {u[4]} | saída {u[1]}')
+    for liga in ('sui.1', 'aut.1', 'bel.1', 'den.1', 'fin.1', 'pol.1', 'cze.1', 'rou.1', 'cro.1', 'isr.1', 'eng.5', 'swe.2'):
+        j = espn(f'{ESPN}/soccer/{liga}/scoreboard?dates=20261108')
+        log(f"R|liga fora do pacote 'all'? {liga}: " + ('sem resposta' if j is None else f"{len(j.get('events') or [])} jogos em 08/11"))
     log(f'R|pedidos à fonte de placar {N_REQ[0]} | resumos {len(RESUMOS)} {json.dumps(fontes)} | tempo {time.time() - t0:.0f}s')
     log('@FIM')
 
