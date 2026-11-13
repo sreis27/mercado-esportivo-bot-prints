@@ -51,8 +51,11 @@ def apostas_do_dia():
     ]
 APOSTAS = apostas_do_dia()
 DUVIDA = {'Mais de 215.5': 'linha pouco legível'}        # o modelo leu esta com dúvida: a proposta sai com ressalva
-TABELA, AVISOS_T = {}, {}
+TABELA, AVISOS_T, DIVT = {}, {}, {}
 CONSULTAS = []
+def por_id(path):
+    ids = re.search(r'id=in\.\((.*?)\)', path).group(1).split(',')
+    return [{k: v for k, v in a.items() if not k.startswith('_')} for a in APOSTAS if a['id'] in ids]
 def sb_get_falso(path):
     if path.startswith('esportes'):
         return [{'id': e, 'nome': e} for e in sorted({a['esporte_id'] for a in APOSTAS})]
@@ -60,12 +63,20 @@ def sb_get_falso(path):
         return [{'id': 'k1', 'nome': '1win'}, {'id': 'k2', 'nome': 'Polymarket'}]
     if path.startswith('apostas?'):
         CONSULTAS.append(path)
+        if 'id=in.(' in path:
+            return por_id(path)
         if 'offset=0' not in path:
             return []
         return [{k: v for k, v in a.items() if not k.startswith('_')} for a in APOSTAS]
+    if path.startswith('apuracoes?select=aposta_id,status_proposto,motivo&status_proposto=not.is.null'):
+        if 'offset=0' not in path:
+            return []
+        return [{'aposta_id': i, 'status_proposto': l['status_proposto'], 'motivo': l['motivo']} for i, l in sorted(TABELA.items()) if l.get('status_proposto')]
     if path.startswith('apuracoes?'):
         ids = re.search(r'in\.\((.*)\)', path).group(1).split(',')
         return [copy.deepcopy(TABELA[i]) for i in ids if i in TABELA]
+    if path.startswith('apuracao_divergencias?'):
+        return [copy.deepcopy(v) for v in sorted(DIVT.values(), key=lambda x: x['n'])]
     if path.startswith('apuracao_avisos?'):
         return [copy.deepcopy(v) for v in AVISOS_T.values()]
     raise AssertionError(path)
@@ -85,11 +96,20 @@ class Resp:
     def raise_for_status(self): pass
     def json(self): return {}
 def post_falso(url, **k):
+    if '/rest/v1/apuracao_divergencias' in url:
+        for l in json.loads(k['data'].decode('utf-8')):
+            if l['aposta_id'] not in DIVT:
+                DIVT[l['aposta_id']] = dict(l, n=len(DIVT) + 1, situacao='aberta')
+        return Resp()
     assert '/rest/v1/apuracao_avisos' in url, url
     for l in json.loads(k['data'].decode('utf-8')):
         AVISOS_T[l['chave']] = l
     return Resp()
-m.requests.post = post_falso
+def patch_falso(url, **k):
+    assert '/rest/v1/apuracao_divergencias?aposta_id=eq.' in url, url
+    DIVT[url.split('aposta_id=eq.')[1]].update(json.loads(k['data'].decode('utf-8')))
+    return Resp()
+m.requests.post, m.requests.patch = post_falso, patch_falso
 TG = []
 def tg_falso(metodo, **campos):
     TG.append((metodo, campos))
@@ -105,7 +125,7 @@ def roda(fn):
 def cena(modo):
     """Roda o dia inteiro num modo e devolve o que saiu em cada passo."""
     APOSTAS[:] = apostas_do_dia()
-    TABELA.clear(); AVISOS_T.clear(); TG.clear(); m.MEM.clear(); m.MEM_OK[0] = False; m.URGENTE.clear(); m.ENVIOS.clear(); m.JA_PERGUNTEI.clear(); m.JA_ADIANTE.clear()
+    TABELA.clear(); AVISOS_T.clear(); DIVT.clear(); m.DIV.update(quando=None, lista=None); TG.clear(); m.MEM.clear(); m.MEM_OK[0] = False; m.URGENTE.clear(); m.ENVIOS.clear(); m.JA_PERGUNTEI.clear(); m.JA_ADIANTE.clear()
     m.TG_MODO, m.TG_TOKEN, m.TG_CHAT, m.TG_DESDE = modo, 'x', '-100', None
     FUT['20261109'][0] = ev('e7', '2026-11-09T19:00Z', 'STATUS_SCHEDULED', 'pre', '2:00 PM', time_('112', 'Lazio', True, 0), time_('114', 'Napoli', False, 0))
     NBA['20261109'][0] = copy.deepcopy(NBA_PRE)
@@ -223,11 +243,21 @@ RELOGIO[0] = datetime(2026, 11, 10, 9, 59, tzinfo=timezone.utc)      # 06h59
 antes = len(TG)
 roda(m.avisos)
 confere('fechamento: antes das 7h não sai', len(TG) - antes, 0)
+# uma marcada diferente do placar, do piloto (a5: marcada red, o placar dá green)
+DIVT['a5'] = {'n': 1, 'aposta_id': 'a5', 'placar': 'WON', 'prova': '1x0', 'ressalva': None, 'origem': 'piloto', 'situacao': 'aberta'}
 RELOGIO[0] = datetime(2026, 11, 10, 10, 1, tzinfo=timezone.utc)      # 07h01
 antes = len(TG)
 roda(m.avisos)
 saiu = TG[antes:]
-confere('fechamento: às 7h sai uma mensagem nova, com som', ([x[0] for x in saiu], saiu[0][1].get('disable_notification')), (['sendMessage'], False))
+confere('fechamento: às 7h sai uma mensagem nova, com som, e a lista das marcadas diferente logo depois, sem som',
+        ([x[0] for x in saiu], saiu[0][1].get('disable_notification'), saiu[1][1].get('disable_notification')), (['sendMessage', 'sendMessage'], False, True))
+print('--- marcadas diferente do placar às 7h:'); print(saiu[1][1]['text'])
+confere('lista: texto das 7h', saiu[1][1]['text'], """❗ Marcadas diferente do placar · 1
+
+#1 · 09/11 · Time X x Time Y · Time X @2,00 · R$ 500,00
+↳ marcada red; pelo placar (1x0) é green
+
+Sai daqui quando a marcação no dashboard bater com o placar. Se a casa pagou do jeito que está marcado, manda o número (#) no chat do Claude.""")
 print('--- fechamento às 7h:'); print(saiu[0][1]['text'])
 confere('fechamento: texto das 7h', saiu[0][1]['text'], '''☀️ Fechamento de ontem · seg 09/11
 
@@ -243,7 +273,7 @@ confere('fechamento: texto das 7h', saiu[0][1]['text'], '''☀️ Fechamento de 
 confere('fechamento: guardou o estado', (AVISOS_T.get('fechamento:2026-11-09') or {}).get('estado'), 'fechamento')
 antes = len(TG)
 roda(m.avisos)
-confere('fechamento: sem mudança não repete', len(TG) - antes, 0)
+confere('fechamento e lista: sem mudança não repetem', len(TG) - antes, 0)
 # as baixas entram: uma igual ao robô, uma diferente; aparece uma pendente velha e uma sem fonte de placar
 for a in APOSTAS:
     if a['id'] == 'a1':
@@ -258,8 +288,9 @@ roda(lambda: m.ciclo(None))
 antes = len(TG)
 roda(m.avisos)
 saiu = TG[antes:]
-confere('fechamento: com as baixas, edita a mesma mensagem (sem mandar outra)',
-        ([x[0] for x in saiu], saiu[0][1].get('message_id')), (['editMessageText'], AVISOS_T['fechamento:2026-11-09']['msg_id']))
+confere('com as baixas, edita o fechamento e a lista (sem mandar outra)',
+        ([x[0] for x in saiu], saiu[0][1].get('message_id'), saiu[1][1].get('message_id')),
+        (['editMessageText', 'editMessageText'], AVISOS_T['fechamento:2026-11-09']['msg_id'], AVISOS_T['divergencias:2026-11-10']['msg_id']))
 print('--- fechamento depois das baixas:'); print(saiu[0][1]['text'])
 confere('fechamento: texto depois das baixas', saiu[0][1]['text'], '''☀️ Fechamento de ontem · seg 09/11
 
@@ -270,9 +301,6 @@ confere('fechamento: texto depois das baixas', saiu[0][1]['text'], '''☀️ Fec
 🤖 Das 2 que faltam, o robô já apurou 1: 🟢 1 · 🔴 0
 📊 Resultado do dia até aqui (baixas + robô): +0,75u · R$ +625,00 · US$ -50,00
 
-❗ Marcadas diferente do robô (1)
-• Lazio x Napoli · Lazio @2,10 · Polymarket · marcada red, robô green
-
 ⚠️ Pra revisar (1)
 • Timberwolves x Hornets · Mais de 215.5 @1,90 · 1win · robô: green · leitura com dúvida: linha pouco legível
 
@@ -281,6 +309,35 @@ confere('fechamento: texto depois das baixas', saiu[0][1]['text'], '''☀️ Fec
 
 📌 De dias anteriores, ainda sem baixa (1)
 • 05/11 · Dupla: Time Velho + Outro Velho @3,00 · Polymarket · ''' + m.situacao(TABELA.get('a7') or {}, RELOGIO[0].astimezone(m.BRT))[1])
+print('--- lista depois das baixas:'); print(saiu[1][1]['text'])
+confere('lista: a da sombra entra com o número seguinte, com a conta do robô', saiu[1][1]['text'].split('\n\nSai daqui')[0], """❗ Marcadas diferente do placar · 2
+
+#1 · 09/11 · Time X x Time Y · Time X @2,00 · R$ 500,00
+↳ marcada red; pelo placar (1x0) é green
+#2 · 09/11 · Lazio x Napoli · Lazio @2,10 · US$ 50,00 · Polymarket
+↳ marcada red; pelo placar (Lazio 2x1 Napoli) é green""")
+confere('lista: gravou a nova na tabela', (DIVT['a2']['n'], DIVT['a2']['origem'], DIVT['a2']['placar']), (2, 'sombra', 'WON'))
+# corrigem a #1 no dashboard: sai da lista em até 5 min
+for a in APOSTAS:
+    if a['id'] == 'a5':
+        a.update(status='WON', lucro_reais=500, lucro_unidades=1.0)
+RELOGIO[0] = datetime(2026, 11, 10, 12, 3, tzinfo=timezone.utc)
+antes = len(TG)
+roda(m.avisos)
+confere('lista: antes de 5 min não relê', [x for x in TG[antes:] if 'Marcadas diferente' in (x[1].get('text') or '')], [])
+RELOGIO[0] = datetime(2026, 11, 10, 12, 6, tzinfo=timezone.utc)
+antes = len(TG)
+roda(m.avisos)
+lista_txt = [x[1]['text'] for x in TG[antes:] if 'Marcadas diferente' in (x[1].get('text') or '')]
+confere('lista: a corrigida sai e fica marcada na tabela', (len(lista_txt), '#1 ' in (lista_txt or [''])[0], '#2 ' in (lista_txt or [''])[0], DIVT['a5']['situacao']),
+        (1, False, True, 'corrigida'))
+# a casa pagou a #2 do jeito que está: o Claude marca como mantida e ela sai
+DIVT['a2']['situacao'] = 'mantida'
+RELOGIO[0] = datetime(2026, 11, 10, 12, 12, tzinfo=timezone.utc)
+antes = len(TG)
+roda(m.avisos)
+lista_txt = [x[1]['text'] for x in TG[antes:] if 'Marcadas diferente' in (x[1].get('text') or '')]
+confere('lista: sem nenhuma aberta, a mensagem do dia diz que todas batem', lista_txt, ['✅ Marcadas diferente do placar: nenhuma. Todas batem.'])
 confere('fechamento: a velha sem jogo diz por quê', m.situacao(TABELA.get('a7') or {}, RELOGIO[0].astimezone(m.BRT))[1] in ('não achei o jogo', 'ainda procurando o jogo'), True)
 # chega a primeira entrada do dia: painel novo, fixado, e o de ontem sai do alto
 APOSTAS.append(ap('a8', 'Futebol', 'Simples', 'Time Novo x Time Outro', 'Time Novo', 'PENDING', 'BRL', 300, 0.6, '2.00', None, None,
