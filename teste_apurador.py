@@ -39,6 +39,9 @@ FUT = {'20261108': [
  ], '20261109': [
    ev('e7', '2026-11-09T19:00Z', '2026-27-italian-serie-a', 'STATUS_SCHEDULED',
       time_('112', 'Lazio', 'Lazio', 'LAZ', True, 0), time_('114', 'Napoli', 'Napoli', 'NAP', False, 0)),
+ ], '20261113': [
+   ev('e9', '2026-11-13T19:00Z', '2026-27-italian-serie-a', 'STATUS_SCHEDULED',
+      time_('120', 'Empoli', 'Empoli', 'EMP', True, 0), time_('121', 'Parma', 'Parma', 'PAR', False, 0)),
  ]}
 NBA = {'20261108': [
    ev('n1', '2026-11-08T20:30Z', '2026-27', 'STATUS_FINAL',
@@ -104,6 +107,8 @@ APOSTAS = [
  ap('b16', 'Futebol', 'Simples', 'Resultado Final', 'Genoa x AC Milan', 'Genoa', 'LOST', '2026-11-08', F1(a='Genoa', b='AC Milan', tipo='1x2', lado='a')),
  ap('b17', 'NBA', 'Simples', 'Pontos total', 'Clippers x Lakers', 'Mais de 200.5', 'WON', '2026-11-08',
     [dict(esp='nba', a='Los Angeles Clippers', b='Los Angeles Lakers', tipo='total', met='pontos', lado='over', linha=200.5)]),
+ # registrada com a data do dia em que entrou; o jogo é cinco dias depois
+ ap('b18', 'Futebol', 'Simples', 'Resultado Final', 'Empoli x Parma', 'Empoli', 'PENDING', '2026-11-08', F1(a='Empoli', b='Parma', tipo='1x2', lado='a')),
 ]
 TABELA, GRAVACOES = {}, []
 def sb_get_falso(path):
@@ -162,7 +167,8 @@ esperado = {'b01': ('WON', 'apurou', True, True), 'b02': ('WON', 'conferir', Fal
             'b04': ('LOST', 'conferir', False, True), 'b05': ('WON', 'apurou', True, True), 'b06': ('LOST', 'apurou', True, True),
             'b07': ('WON', 'apurou', True, True), 'b08': (None, 'fora', False, True), 'b09': (None, 'sem_jogo', False, False),
             'b10': (None, 'nao_terminou', False, False), 'b11': (None, 'aguarda', False, False), 'b12': (None, 'sem_jogo', False, True),
-            'b15': (None, None, False, False), 'b16': ('LOST', 'conferir', False, True), 'b17': ('WON', 'apurou', True, True)}
+            'b15': (None, None, False, False), 'b16': ('LOST', 'conferir', False, True), 'b17': ('WON', 'apurou', True, True),
+            'b18': (None, 'nao_terminou', False, False)}
 for i, e in esperado.items():
     l = L.get(i) or {}
     confere(f'c1 {i}', (l.get('status_proposto'), l.get('classe'), l.get('fecharia'), l.get('final')), e)
@@ -177,6 +183,19 @@ confere('c1 b11 próxima em 30 min', L['b11']['proxima_em'], '2026-11-09T04:00:0
 confere('c1 b09 próxima em 3 h', L['b09']['proxima_em'], '2026-11-09T06:30:00Z')
 confere('c1 b15 tem ficha e nada mais', (bool(L['b15']['ficha']), L['b15']['tentativas']), (True, 0))
 confere('c1 b17 casou Clippers x Lakers certo', 'LA Clippers 110x100' in (L['b17']['motivo'] or ''), True)
+confere('c1 b18 (data errada): achou o jogo dias à frente e espera por ele',
+        ((L['b18']['jogos'] or [{}])[0].get('como'), L['b18']['inicio'], L['b18']['proxima_em']), ('data', '2026-11-13T19:00:00Z', '2026-11-13T20:55:00Z'))
+confere('c1 b09 (sem jogo nenhum à frente) segue sem jogo', (L['b09']['classe'], L['b09']['jogos']), ('sem_jogo', None))
+perna = dict(esp='futebol', a='Empoli', b='Parma', tipo='1x2', lado='a')
+FUT['20261114'] = [ev('e10', '2026-11-14T19:00Z', 'coppa-italia', 'STATUS_SCHEDULED',
+                      time_('120', 'Empoli', 'Empoli', 'EMP', False, 0), time_('121', 'Parma', 'Parma', 'PAR', True, 0))]
+m.PLACARES.clear()
+confere('busca adiante: dois jogos possíveis = não escolhe', m.acha_jogo_adiante(perna, date(2026, 11, 8), False), (None, None))
+del FUT['20261114']
+m.PLACARES.clear()
+confere('busca adiante: um time só não vale', m.acha_jogo_adiante(dict(esp='futebol', a='Empoli', tipo='1x2', lado='a'), date(2026, 11, 8), False), (None, None))
+confere('busca adiante: um jogo só = casa', (m.acha_jogo_adiante(perna, date(2026, 11, 8), False)[0] or {}).get('id'), 'e9')
+confere('busca adiante: masculino não casa com pedido de feminino', m.acha_jogo_adiante(perna, date(2026, 11, 8), True), (None, None))
 confere('c1 chamadas ao modelo', dict(chamadas), {'ficha': 2, 'casa': 1})
 confere('c1 sem erro no log', [x for x in saida.splitlines() if 'ERRO' in x], [])
 confere('c1 marcou divergência no log (b04 e b16)', saida.count('≠ MARCAÇÃO'), 1)
@@ -217,5 +236,22 @@ r, saida = roda()
 confere('c5 refez a ficha e a proposta', (L['b01']['status_proposto'], L['b01']['classe'], L['b01']['tentativas']), ('LOST', 'apurou', 1))
 confere('c5 avisou a diferença no log', '≠ MARCAÇÃO' in saida, True)
 confere('c5 b15 entrou na vez (11/11 = amanhã) e não achou jogo nesse dia', (L['b15']['classe'], L['b15']['final']), ('sem_jogo', False))
+
+# ---------- ciclo 6: o jogo da aposta com a data errada está em andamento, cinco dias depois da data dela
+FUT['20261113'][0] = ev('e9', '2026-11-13T19:00Z', '2026-27-italian-serie-a', 'STATUS_SECOND_HALF',
+                        time_('120', 'Empoli', 'Empoli', 'EMP', True, 1), time_('121', 'Parma', 'Parma', 'PAR', False, 0), [gol('120')])
+RELOGIO[0] = datetime(2026, 11, 13, 20, 56, tzinfo=timezone.utc)
+r, saida = roda()
+confere('c6 b18 não desiste: o prazo conta do dia do jogo', (L['b18']['classe'], L['b18']['final'], L['b18']['proxima_em']), ('nao_terminou', False, '2026-11-13T21:01:00Z'))
+confere('c6 b18 reaproveitou o jogo guardado', (L['b18']['jogos'] or [{}])[0].get('como'), 'data')
+
+# ---------- ciclo 7: acabou; a proposta sai com a ressalva da data
+FUT['20261113'][0] = ev('e9', '2026-11-13T19:00Z', '2026-27-italian-serie-a', 'STATUS_FULL_TIME',
+                        time_('120', 'Empoli', 'Empoli', 'EMP', True, 1), time_('121', 'Parma', 'Parma', 'PAR', False, 0), [gol('120')])
+RELOGIO[0] = datetime(2026, 11, 13, 21, 2, tzinfo=timezone.utc)
+r, saida = roda()
+confere('c7 b18 proposta com ressalva (nunca fecha sozinha)', (L['b18']['status_proposto'], L['b18']['classe'], L['b18']['fecharia'], L['b18']['final']), ('WON', 'conferir', False, True))
+confere('c7 b18 diz que a data não bate', 'a data da aposta (2026-11-08) não é a do jogo (2026-11-13)' in (L['b18']['motivo'] or ''), True)
+confere('c7 sem erro no log', [x for x in saida.splitlines() if 'ERRO' in x], [])
 print('gravações:', GRAVACOES, '| pedidos à fonte:', len(pedidos), '| chamadas:', chamadas)
 print('FALHAS:', falhas)

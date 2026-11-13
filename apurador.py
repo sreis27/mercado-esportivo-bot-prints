@@ -160,6 +160,7 @@ CONVENÇÕES DO TEXTO
 - Em handicap, o número depois do time é a linha dele: "Time -1", "Time (+3.5)"; "Time (3.5)" = +3.5. "1", "H1", "Casa" = lado "a"; "2", "H2", "Fora" = lado "b". "H1 (0)" = handicap do lado "a", linha 0.
 - "Jogador Acima 10.5 Pontos, Acima 3.5 Rebotes, Acima 1.5 Assistências" são TRÊS pernas (cada estatística tem a sua linha; a palavra "Acima" pode aparecer só na primeira). "Jogador +19.5 Pontos, Rebotes e Assistências" ou "Acima 43.5 Pontos + Assistências + Rebotes" é UMA perna com a soma.
 - Vírgula decimal vale como ponto ("6,5" = 6.5).
+- "Time (Half-Time)", "Time HT", "Time 1º tempo", "Time (Intervalo)" = "1x2" com "per":"1t" (o time vence o 1º tempo). Não é "outro".
 - Se a entrada cita um time e um total ("Kilmarnock Over 0.5" no mercado Gols), é total daquele time.
 - Mercado diz handicap mas a entrada não tem linha nenhuma (só o nome do time, ou "Time com PA"): leia como "1x2" e explique em "duvida".
 - Não use o que você lembra de elenco: jogador troca de time. Não ponha dúvida por achar que o jogador não é de nenhum dos times do evento.
@@ -870,6 +871,8 @@ def apura_aposta(a, f, casados):
                 raise NaoSei('regra_casa', 'meia linha sem regra')
             if como == 'jogador_outro_jogo':
                 ressalva = '; '.join(x for x in (ressalva, 'o jogo do jogador não é o que está escrito no evento') if x)
+            if como == 'data':
+                ressalva = '; '.join(x for x in (ressalva, f"a data da aposta ({a['data_evento']}) não é a do jogo ({j['dia_brt']})") if x)
             res.append((s, None, ev, ressalva))
         except NaoSei as e:
             res.append((None, e.classe, f'{rotulo_jogo(j)} → {e.motivo}', None))
@@ -959,6 +962,26 @@ def linha_nova(aposta_id, h, agora, **kw):
 
 # ------------------------------------------------------------------ casar e agendar
 JA_PERGUNTEI = set()      # (aposta, perna, texto) que o modelo já tentou casar nesta execução
+JA_ADIANTE = set()        # (aposta, perna, texto) que já procurou o jogo nos dias seguintes
+
+def acha_jogo_adiante(p, D, fem):
+    """A data da aposta pode estar errada (registrada antes do jogo): procura o mesmo confronto nos 7 dias seguintes.
+    Só vale com os dois times e se existir um jogo só."""
+    a, b = norm(p.get('a')), norm(p.get('b'))
+    if not (a and b):
+        return None, None
+    achados = {}
+    for dd in range(2, 8):
+        for j in jogos_do_dia(p['esp'], D + timedelta(days=dd)):
+            if p['esp'] == 'futebol' and eh_fem(j) != bool(fem):
+                continue
+            t0, t1 = j['times']
+            d = min(sim_time(a, t0), sim_time(b, t1))
+            i = min(sim_time(a, t1), sim_time(b, t0))
+            s, ia = (d, 0) if d >= i else (i, 1)
+            if s >= 0.86:
+                achados[j['id']] = (j, ia)
+    return list(achados.values())[0] if len(achados) == 1 else (None, None)
 
 def casa_lote(cli, vez, linhas):
     """Casa cada perna das apostas da vez com um jogo. Devolve {(aposta_id, k): (jogo|None, ia, como|motivo)}."""
@@ -966,7 +989,7 @@ def casa_lote(cli, vez, linhas):
     for a in vez:
         l = linhas[a['id']]
         f = l.get('ficha') or {}
-        guardados = {g.get('k'): g for g in (l.get('jogos') or []) if isinstance(g, dict) and g.get('como') == 'modelo'}
+        guardados = {g.get('k'): g for g in (l.get('jogos') or []) if isinstance(g, dict) and g.get('como') in ('modelo', 'data')}
         fem_ap = a['esporte'] == 'Futebol Feminino'
         for k, p in enumerate(f.get('pernas') or []):
             if not isinstance(p, dict) or p.get('esp') not in CAM:
@@ -974,13 +997,20 @@ def casa_lote(cli, vez, linhas):
             chave = (a['id'], k)
             try:
                 g = guardados.get(k)
-                if g:                                   # o modelo já casou esta perna antes: reaproveita
-                    j = next((x for x in candidatos(p['esp'], a['D']) if x['id'] == str(g.get('id'))), None)
+                if g:                                   # esta perna já foi casada antes (pelo modelo ou pela busca adiante): reaproveita
+                    lista = jogos_do_dia(p['esp'], date.fromisoformat(g['dia_espn'])) if g.get('dia_espn') else candidatos(p['esp'], a['D'])
+                    j = next((x for x in lista if x['id'] == str(g.get('id'))), None)
                     if j:
-                        casados[chave] = (j, int(g.get('ia') or 0), 'modelo')
+                        casados[chave] = (j, int(g.get('ia') or 0), g.get('como'))
                         continue
                 if p.get('a') or p.get('b'):
                     j, ia, motivo = acha_jogo(p, a['D'], fem_ap or bool(p.get('fem')))
+                    if not j and p.get('a') and p.get('b') and (a['id'], k, l['texto_hash']) not in JA_ADIANTE:
+                        JA_ADIANTE.add((a['id'], k, l['texto_hash']))
+                        j2, ia2 = acha_jogo_adiante(p, a['D'], fem_ap or bool(p.get('fem')))
+                        if j2:
+                            casados[chave] = (j2, ia2, 'data')
+                            continue
                     if j:
                         casados[chave] = (j, ia, 'nome')
                     elif p.get('tipo') == 'jogador' and p.get('jog') and p['esp'] in ('nba', 'nhl', 'nfl'):
@@ -1013,7 +1043,8 @@ def agenda(r, a, agora, hoje, tentativas):
     if r['status'] or cl in ('fora', 'mercado', 'ficha', 'ambiguo', 'regra_casa'):
         return True, None
     if cl == 'nao_terminou':
-        if hoje > D + timedelta(days=3):
+        ultimo = max([j['dia_brt'] for _, j, _, _ in r['jogos']] + [D])       # o prazo conta do dia do jogo, não da data da aposta
+        if hoje > ultimo + timedelta(days=3):
             return True, None
         ts = []
         for _, j, _, _ in r['jogos']:
@@ -1156,9 +1187,9 @@ def tg_vivo():
     return bool(TG_TOKEN and TG_CHAT) and (TG_MODO == 'ligado' or (TG_MODO == 'ensaio' and TG_DESDE is not None and agora_utc() >= TG_DESDE))
 
 def silencio():
-    """Das 23h às 8h (Brasília) nenhuma mensagem toca; o resultado chega do mesmo jeito, sem som."""
+    """Das 23h às 7h (Brasília) nenhuma mensagem toca; o resultado chega do mesmo jeito, sem som."""
     h = agora_utc().astimezone(BRT).hour
-    return h >= 23 or h < 8
+    return h >= 23 or h < 7
 
 def tg(metodo, **campos):
     """Chamada ao Telegram. O erro nunca carrega o endereço (que tem o token)."""
@@ -1177,8 +1208,9 @@ def av_carrega():
         return
     MEM.clear()
     desde = iso(agora_utc() - timedelta(days=3))
-    for l in sb_get(f'apuracao_avisos?select=chave,msg_id,texto,estado,atualizado_em&atualizado_em=gte.{desde}&chat_id=eq.{TG_CHAT}'):
-        MEM[l['chave']] = {'msg_id': l.get('msg_id'), 'texto': l.get('texto'), 'estado': l.get('estado'), 'quando': de_iso(l.get('atualizado_em'))}
+    for l in sb_get(f'apuracao_avisos?select=chave,msg_id,texto,estado,dados,atualizado_em&atualizado_em=gte.{desde}&chat_id=eq.{TG_CHAT}'):
+        MEM[l['chave']] = {'msg_id': l.get('msg_id'), 'texto': l.get('texto'), 'estado': l.get('estado'), 'quando': de_iso(l.get('atualizado_em')),
+                           'fixado': bool((l.get('dados') or {}).get('fixado'))}
     MEM_OK[0] = True
 
 def av_guarda(chave, **campos):
@@ -1190,7 +1222,8 @@ def av_guarda(chave, **campos):
             r = requests.post(f'{SB_URL}/rest/v1/apuracao_avisos?on_conflict=chave',
                               headers=_cab({'Prefer': 'resolution=merge-duplicates,return=minimal'}),
                               data=json.dumps([{'chave': chave, 'chat_id': int(TG_CHAT), 'msg_id': e['msg_id'], 'texto': e['texto'],
-                                                'estado': e['estado'], 'atualizado_em': iso(e['quando'])}], ensure_ascii=False).encode('utf-8'), timeout=30)
+                                                'estado': e['estado'], 'dados': ({'fixado': True} if e.get('fixado') else None),
+                                                'atualizado_em': iso(e['quando'])}], ensure_ascii=False).encode('utf-8'), timeout=30)
             r.raise_for_status()
         except Exception as ex:
             log('ERRO ao guardar aviso', chave, type(ex).__name__)
@@ -1259,11 +1292,158 @@ def previsto(a, st):
 
 BOLA = {'WON': '🟢', 'HALF WON': '🟢', 'LOST': '🔴', 'HALF LOST': '🔴', 'VOID': '⚪'}
 NOME_ST = {'WON': 'green', 'HALF WON': 'meio green', 'LOST': 'red', 'HALF LOST': 'meio red', 'VOID': 'devolvida'}
+ICONE = {'futebol': '⚽', 'nba': '🏀', 'nhl': '🏒', 'nfl': '🏈', 'mma': '🥊'}
+POR_QUE = {'fora': '', 'sem_jogo': 'não achei o jogo', 'mercado': 'mercado que o robô ainda não lê', 'regra_casa': 'depende da regra da casa',
+           'ambiguo': 'mais de um jogo possível', 'ficha': 'não consegui ler a aposta', 'erro': 'erro na apuração',
+           'nao_terminou': 'o jogo não fechou no placar', 'sem_dado': 'o placar não trouxe a estatística'}
+ESPERA = {'sem_jogo': 'ainda procurando o jogo', 'nao_terminou': 'esperando o fim do jogo', 'aguarda': 'esperando o fim do jogo',
+          'sem_dado': 'esperando a estatística do jogo'}
+MULTI = ('dupla', 'tripla', 'multipla', 'múltipla', 'combinada')
+TETO_MSG = 3800     # o Telegram aceita 4096 por mensagem
+
+def nome_aposta(a):
+    """Evento, entrada, odd e casa numa linha curta."""
+    ev, en = curto(a.get('evento'), 36), curto(a.get('entrada'), 48)
+    odd = f" @{fl(a.get('odd')):.2f}".replace('.', ',') if a.get('odd') else ''
+    casa = casa_de(a)
+    casa = f' · {casa}' if casa else ''
+    if not en or en.lower() == ev.lower():
+        return ev + odd + casa
+    if not ev:
+        return en + odd + casa
+    return f"{ev}{': ' if ev.lower() in MULTI else ' · '}{en}{odd}{casa}"
+
+def quando_txt(ini, brt):
+    q = ini.astimezone(BRT)
+    dias = (q.date() - brt.date()).days
+    dia_txt = 'hoje' if dias == 0 else 'amanhã' if dias == 1 else f"{SEMANA[q.weekday()]} {q.strftime('%d/%m')}"
+    return f"{dia_txt} às {q.strftime('%H:%M')}"
+
+def situacao(l, brt):
+    """Como está uma aposta sem baixa: ('robo' | 'revisar' | 'mao' | 'espera', texto)."""
+    st = l.get('status_proposto')
+    if st:
+        if l.get('classe') == 'conferir':
+            motivo = l.get('motivo') or ''
+            porque = motivo.split('ressalva: ')[-1] if 'ressalva: ' in motivo else ''
+            return 'revisar', f"robô: {NOME_ST.get(st, st)}" + (f" · {curto(porque, 110)}" if porque else '')
+        return 'robo', f"robô: {NOME_ST.get(st, st)}"
+    if not l or l.get('final'):
+        return 'mao', POR_QUE.get(l.get('classe'), 'sem apuração automática')
+    ini = de_iso(l.get('inicio'))
+    if ini and ini > agora_utc():
+        return 'espera', 'jogo ' + quando_txt(ini, brt)
+    return 'espera', ESPERA.get(l.get('classe'), 'esperando o resultado')
+
+def junta_secoes(p, secoes, fim=()):
+    """Põe as listas no texto sem passar do tamanho de uma mensagem: corta linha inteira e diz quantas ficaram de fora."""
+    cheias = [(t, lista) for t, lista in secoes if lista]
+    for n, (titulo, lista) in enumerate(cheias):
+        p += ['', titulo]
+        reserva = sum(len(t) + 20 for t, _ in cheias[n + 1:]) + sum(len(x) + 1 for x in fim)
+        postas = 0
+        for linha in lista[:12]:
+            if sum(len(x) + 1 for x in p) + len(linha) + 1 + reserva > TETO_MSG:
+                break
+            p.append(linha)
+            postas += 1
+        if postas < len(lista):
+            p.append(f'e mais {len(lista) - postas}')
+    return p + list(fim)
+
+def texto_fechamento(ontem, brt, aps, linhas):
+    """O fechamento do dia anterior: como está, o que revisar e quantas faltam dar baixa. None se não há o que dizer."""
+    do = sorted((a for a in aps if a['data_evento'] == str(ontem)), key=lambda a: ((a.get('evento') or '').lower(), (a.get('entrada') or '').lower(), a['id']))
+    velhas = sorted((a for a in aps if a['data_evento'] < str(ontem) and a['status'] == 'PENDING'), key=lambda a: (a['data_evento'], a['id']))
+    if not do and not velhas:
+        return None
+    mapa = esportes()
+    t = {'u': 0.0, 'BRL': 0.0, 'USD': 0.0, 'lu': 0.0, 'lBRL': 0.0, 'lUSD': 0.0, 'ru': 0.0, 'rBRL': 0.0, 'rUSD': 0.0}
+    baixa, falta, cont = 0, 0, {'WON': 0, 'LOST': 0, 'VOID': 0}
+    diferentes, revisar, na_mao, esperando = [], [], [], []
+    for a in do:
+        m = 'USD' if a.get('moeda') == 'USD' else 'BRL'
+        t['u'] += fl(a.get('stake_unidades'))
+        t[m] += fl(a.get('stake_usd')) if m == 'USD' else fl(a.get('stake_reais'))
+        l = linhas.get(a['id']) or {}
+        st = l.get('status_proposto')
+        nome = nome_aposta(a)
+        if a['status'] != 'PENDING':
+            baixa += 1
+            t['lu'] += fl(a.get('lucro_unidades'))
+            t['l' + m] += fl(a.get('lucro_usd')) if m == 'USD' else fl(a.get('lucro_reais'))
+            if st and a['status'] != 'CASH OUT' and a['status'] != st:
+                diferentes.append(f"• {nome} · marcada {NOME_ST.get(a['status'], a['status'])}, robô {NOME_ST.get(st, st)}"
+                                  + (' (com ressalva)' if l.get('classe') == 'conferir' else ''))
+            continue
+        falta += 1
+        tipo, txt = situacao(l, brt)
+        if st:
+            pu, pd = previsto(a, st)
+            t['ru'] += pu or 0.0
+            t['r' + m] += pd or 0.0
+            cont['WON' if 'WON' in st else 'LOST' if 'LOST' in st else 'VOID'] += 1
+        if tipo == 'revisar':
+            revisar.append(f'• {nome} · {txt}')
+        elif tipo == 'mao':
+            esporte = mapa.get(a.get('esporte_id')) or 'sem esporte'
+            na_mao.append((esporte.lower(), f'• {esporte} · {nome}' + (f' · {txt}' if txt else '')))
+        elif tipo == 'espera':
+            esperando.append(f'• {nome} · {txt}')
+    na_mao = [x for _, x in sorted(na_mao, key=lambda x: x[0])]
+    apur = sum(cont.values())
+    p = [f"☀️ Fechamento de ontem · {SEMANA[ontem.weekday()]} {ontem.strftime('%d/%m')}", '']
+    if do:
+        marcado = f" · {uni(t['lu'], True)} · {din(t['lBRL'], 'BRL', True)} · {din(t['lUSD'], 'USD', True)}" if baixa else ''
+        p.append(f"🎯 {len(do)} {'entrada' if len(do) == 1 else 'entradas'} · {uni(t['u'])} · {din(t['BRL'], 'BRL')} · {din(t['USD'], 'USD')}")
+        p += [f'✅ Com baixa: {baixa}{marcado}', f'⏳ Faltam dar baixa: {falta}'] if falta else [f'✅ Todas com baixa{marcado}']
+        if apur:
+            p += ['', (f"🤖 Das {falta} que faltam, o robô já apurou {apur}" if falta > 1 else '🤖 O robô já apurou a que falta')
+                  + f": 🟢 {cont['WON']} · 🔴 {cont['LOST']}" + (f" · ⚪ {cont['VOID']}" if cont['VOID'] else ''),
+                  f"📊 Resultado do dia até aqui (baixas + robô): {uni(t['lu'] + t['ru'], True)} · {din(t['lBRL'] + t['rBRL'], 'BRL', True)} · "
+                  f"{din(t['lUSD'] + t['rUSD'], 'USD', True)}"]
+    else:
+        p.append('Ontem não teve entrada.')
+    antigas = []
+    for a in velhas:
+        tipo, txt = situacao(linhas.get(a['id']) or {}, brt)
+        antigas.append(f"• {a['data_evento'][8:10]}/{a['data_evento'][5:7]} · {nome_aposta(a)} · {txt or 'sem apuração automática'}")
+    return '\n'.join(junta_secoes(p, ((f'❗ Marcadas diferente do robô ({len(diferentes)})', diferentes),
+                                      (f'⚠️ Pra revisar ({len(revisar)})', revisar),
+                                      (f'✋ Sem apuração automática, baixa na mão ({len(na_mao)})', na_mao),
+                                      (f'🕒 Ainda sem resultado ({len(esperando)})', esperando),
+                                      (f'📌 De dias anteriores, ainda sem baixa ({len(antigas)})', antigas))))
 
 def rotulo_aposta(a):
     tipo = (a.get('tipo_aposta') or '').strip()
     pre = (tipo + ': ') if tipo.lower() in ('dupla', 'tripla', 'multipla', 'múltipla') else ''
     return pre + curto(a.get('entrada') or a.get('evento'), 70) + (f" @{fl(a.get('odd')):.2f}".replace('.', ',') if a.get('odd') else '')
+
+CASAS = {'quando': 0.0, 'mapa': {}}
+
+def casas():
+    """Nome das casas de aposta (tabela bookies), relido a cada hora. Se a leitura falhar, a mensagem sai sem a casa."""
+    idade = time.time() - CASAS['quando']
+    if idade > 3600 or (not CASAS['mapa'] and idade > 120):
+        CASAS['quando'] = time.time()
+        try:
+            CASAS['mapa'] = {b['id']: b['nome'] for b in sb_get('bookies?select=id,nome') if b.get('nome')}
+        except Exception as ex:
+            log('aviso: não li as casas de aposta:', type(ex).__name__)
+    return CASAS['mapa']
+
+def casa_de(a):
+    return casas().get(a.get('bookie_id')) or ''
+
+def stake_txt(a):
+    """O valor da entrada na moeda dela: reais ou dólar, nunca somados."""
+    usd = a.get('moeda') == 'USD'
+    v = fl(a.get('stake_usd')) if usd else fl(a.get('stake_reais'))
+    return din(v, 'USD' if usd else 'BRL') if v else ''
+
+def linha_entrada(a):
+    """A entrada como vai na mensagem do jogo: o que é, a odd, o valor e a casa."""
+    return ' · '.join(x for x in (rotulo_aposta(a), stake_txt(a), casa_de(a)) if x)
 
 def hora_brt(d):
     return d.astimezone(BRT).strftime('%H:%M')
@@ -1276,9 +1456,11 @@ def avisos():
     agora = agora_utc()
     brt = agora.astimezone(BRT)
     dia = (brt - timedelta(hours=5)).date()                 # o "dia" do painel vira às 5h
+    d0, d1, d30 = dia - timedelta(days=1), dia + timedelta(days=1), dia - timedelta(days=30)
     aps = sb_todos('apostas?select=id,data_evento,evento,entrada,tipo_aposta,status,odd,moeda,stake_unidades,stake_reais,stake_usd,'
-                   f'lucro_unidades,lucro_reais,lucro_usd&data_evento=gte.{dia - timedelta(days=1)}&data_evento=lte.{dia + timedelta(days=1)}&order=id.asc')
-    aps = [a for a in aps if a['id'] not in PULAR]
+                   'lucro_unidades,lucro_reais,lucro_usd,esporte_id,bookie_id'
+                   f'&or=(and(data_evento.gte.{d0},data_evento.lte.{d1}),and(status.eq.PENDING,data_evento.gte.{d30},data_evento.lt.{d0}))&order=id.asc')
+    aps = [a for a in aps if a['id'] not in PULAR and a.get('data_evento')]
     linhas = carrega_linhas([a['id'] for a in aps]) if aps else {}
     PLACARES.clear()
 
@@ -1322,10 +1504,10 @@ def avisos():
         st = a['status'] if a['status'] != 'PENDING' else (l.get('status_proposto') if com_resultado else None)
         if st in BOLA:
             quem = '' if a['status'] != 'PENDING' else (' (robô)' if l.get('classe') == 'apurou' else ' (robô, confere)')
-            return f"{BOLA[st]} {rotulo_aposta(a)} · {NOME_ST[st]}{quem}"
+            return f"{BOLA[st]} {linha_entrada(a)} · {NOME_ST[st]}{quem}"
         if com_resultado:
-            return f"⚪ {rotulo_aposta(a)} · sem apuração automática"
-        return f"· {rotulo_aposta(a)}"
+            return f"⚪ {linha_entrada(a)} · sem apuração automática"
+        return f"🎯 {linha_entrada(a)}"
 
     # uma mensagem por jogo
     vivos, seguir = [], []
@@ -1334,6 +1516,7 @@ def avisos():
         e = MEM.get(chave) or {}
         x = j['agora']
         lista = sorted(j['apostas'].values(), key=lambda al: al[0]['id'])
+        ic = ICONE.get(j['esp'], '•')
         if x is None or x.get('estado') == 'pre':
             if j['inicio'] > agora:
                 seguir.append(j)
@@ -1341,11 +1524,11 @@ def avisos():
         if x.get('estado') == 'in' or (not x['completo'] and x.get('estado') != 'post'):
             vivos.append(j)
             txt = f"{placar_txt(j)} · {x.get('detalhe') or 'ao vivo'}\n" + '\n'.join(linha_aposta(a, l, False) for a, l in lista)
-            if e.get('estado') in (None, 'pre'):
+            if e.get('estado') in (None, 'pre'):                      # o jogo começou: a partida e em que entrada estamos; toca fora do silêncio
                 comeco = 'Começou · ' if agora - j['inicio'] < timedelta(minutes=15) else 'Ao vivo · '     # pegou o jogo andando
-                av_manda(chave, comeco + txt, 'vivo', novo=not e.get('msg_id'))
+                av_manda(chave, f'{ic} {comeco}{txt}', 'vivo', novo=not e.get('msg_id'), avisa=True)
             elif e.get('estado') == 'vivo':
-                av_manda(chave, txt, 'vivo')
+                av_manda(chave, f'{ic} {txt}', 'vivo')
             continue
         if x['completo'] and e.get('estado') != 'fim':
             if agora - j['inicio'] > timedelta(hours=6) and e.get('estado') is None:
@@ -1358,11 +1541,11 @@ def avisos():
             if abertas and agora - desde < timedelta(minutes=12):
                 URGENTE.update(a['id'] for a in abertas)                   # pede a apuração já e espera a próxima olhada
                 if e.get('estado') == 'vivo':
-                    av_manda(chave, f"{placar_txt(j)} · fim de jogo\n" + '\n'.join(linha_aposta(a, l, False) for a, l in lista), 'vivo')
+                    av_manda(chave, f"{ic} {placar_txt(j)} · fim de jogo\n" + '\n'.join(linha_aposta(a, l, False) for a, l in lista), 'vivo')
                 continue
-            fim = f"Fim · {placar_txt(j)}\n" + '\n'.join(linha_aposta(a, l, True) for a, l in lista)
+            fim = f"🏁 Fim · {placar_txt(j)}\n" + '\n'.join(linha_aposta(a, l, True) for a, l in lista)
             if e.get('msg_id') and e['msg_id'] > 0:
-                av_manda(chave, f"{placar_txt(j)} · fim de jogo\n" + '\n'.join(linha_aposta(a, l, True) for a, l in lista), 'vivo')
+                av_manda(chave, f"{ic} {placar_txt(j)} · fim de jogo\n" + '\n'.join(linha_aposta(a, l, True) for a, l in lista), 'vivo')
             if av_manda(chave + ':fim', fim, 'fim', novo=True, avisa=True, responde=(MEM.get(chave) or {}).get('msg_id')):
                 MEM.setdefault(chave, {})['estado'] = 'fim'
                 av_guarda(chave, estado='fim')
@@ -1394,26 +1577,29 @@ def avisos():
             else:
                 tot['lu'] += fl(a.get('lucro_unidades'))
                 tot['l' + m] += fl(a.get('lucro_usd')) if m == 'USD' else fl(a.get('lucro_reais'))
-        p = [f"Hoje · {SEMANA[dia.weekday()]} {dia.strftime('%d/%m')} · {brt.strftime('%H:%M')}",
-             f"Entradas {tot['n']} · investido {uni(tot['u'])}",
-             f"{din(tot['BRL'], 'BRL')} · {din(tot['USD'], 'USD')}",
-             f"Pendentes {tot['pn']} · {uni(tot['pu'])} · {din(tot['pBRL'], 'BRL')} · {din(tot['pUSD'], 'USD')}",
-             f"Resultado marcado {uni(tot['lu'], True)} · {din(tot['lBRL'], 'BRL', True)} · {din(tot['lUSD'], 'USD', True)}"]
+        p = [f"📅 Hoje · {SEMANA[dia.weekday()]} {dia.strftime('%d/%m')} · {brt.strftime('%H:%M')}",
+             '',
+             f"🎯 Entradas {tot['n']} · investido {uni(tot['u'])}",
+             f"💰 {din(tot['BRL'], 'BRL')} · {din(tot['USD'], 'USD')}",
+             f"⏳ Pendentes {tot['pn']} · {uni(tot['pu'])} · {din(tot['pBRL'], 'BRL')} · {din(tot['pUSD'], 'USD')}",
+             f"✅ Resultado marcado {uni(tot['lu'], True)} · {din(tot['lBRL'], 'BRL', True)} · {din(tot['lUSD'], 'USD', True)}"]
         if tot['rn']:
-            p.append(f"Com o que o robô já apurou ({tot['rn']}): {uni(tot['lu'] + tot['ru'], True)} · {din(tot['lBRL'] + tot['rBRL'], 'BRL', True)} · "
-                     f"{din(tot['lUSD'] + tot['rUSD'], 'USD', True)}" + (f" · {tot['conf']} pra conferir" if tot['conf'] else ''))
+            p += ['', f"🤖 Com o que o robô já apurou ({tot['rn']}): {uni(tot['lu'] + tot['ru'], True)} · {din(tot['lBRL'] + tot['rBRL'], 'BRL', True)} · "
+                      f"{din(tot['lUSD'] + tot['rUSD'], 'USD', True)}"]
+            if tot['conf']:
+                p.append(f"⚠️ {tot['conf']} pra conferir")
         if vivos:
-            p.append('')
-            p.append('Ao vivo')
+            p += ['', '▶️ Ao vivo']
             for j in vivos[:12]:
-                p.append(f"{placar_txt(j)} · {(j['agora'] or {}).get('detalhe') or ''} · {len(j['apostas'])} " + ('entrada' if len(j['apostas']) == 1 else 'entradas'))
+                p.append(f"{ICONE.get(j['esp'], '•')} {placar_txt(j)} · {(j['agora'] or {}).get('detalhe') or ''} · {len(j['apostas'])} "
+                         + ('entrada' if len(j['apostas']) == 1 else 'entradas'))
         if seguir:
-            p.append('')
-            p.append('A seguir')
+            p += ['', '🕒 A seguir']
             for j in seguir[:10]:
                 quando = j['inicio'].astimezone(BRT)
                 outro_dia = '' if quando.date() == brt.date() else SEMANA[quando.weekday()] + ' '
-                p.append(f"{outro_dia}{hora_brt(j['inicio'])} {j['casa']} x {j['fora']} · {len(j['apostas'])} " + ('entrada' if len(j['apostas']) == 1 else 'entradas'))
+                p.append(f"{ICONE.get(j['esp'], '•')} {outro_dia}{hora_brt(j['inicio'])} {j['casa']} x {j['fora']} · {len(j['apostas'])} "
+                         + ('entrada' if len(j['apostas']) == 1 else 'entradas'))
             if len(seguir) > 10:
                 p.append(f'e mais {len(seguir) - 10}')
         texto = '\n'.join(p)
@@ -1429,9 +1615,27 @@ def avisos():
             e['tentou_fixar'] = time.time()                           # tenta fixar; se o bot não tem permissão, tenta de novo em meia hora
             try:
                 tg('pinChatMessage', chat_id=TG_CHAT, message_id=e['msg_id'], disable_notification=True)
-                e['fixado'] = True
+                av_guarda(chave, fixado=True)
+                velho = MEM.get(f'painel:{dia - timedelta(days=1)}') or {}
+                if velho.get('msg_id') and velho['msg_id'] > 0:       # o painel de ontem sai do alto do grupo
+                    try:
+                        tg('unpinChatMessage', chat_id=TG_CHAT, message_id=velho['msg_id'])
+                    except Exception as ex:
+                        log('aviso: não consegui desafixar o painel de ontem:', str(ex)[:160])
             except Exception as ex:
                 log('aviso: não consegui fixar o painel:', str(ex)[:160])
+
+    # fechamento de ontem: sai às 7h, com som, e vai sendo corrigido no lugar conforme as baixas entram
+    if brt.hour >= 7:
+        ontem = brt.date() - timedelta(days=1)
+        chave = f'fechamento:{ontem}'
+        e = MEM.get(chave) or {}
+        if e.get('msg_id') or brt.hour < 12:                          # um fechamento que não saiu até o meio-dia não sai mais
+            txt = texto_fechamento(ontem, brt, aps, linhas)
+            if txt and not e.get('msg_id'):
+                av_manda(chave, txt, 'fechamento', novo=True, avisa=True)
+            elif txt:
+                av_manda(chave, txt, 'fechamento')
 
 
 
