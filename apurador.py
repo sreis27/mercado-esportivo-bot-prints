@@ -297,6 +297,7 @@ def normaliza(esp, e, d_espn):
                         'liga': ' '.join(x for x in ((e.get('season') or {}).get('slug'), c.get('altGameNote')) if x), 'utc': utc,
                         'dia_brt': utc.astimezone(BRT).date(), 'dia_espn': d_espn,
                         'status': tipo.get('name') or '', 'completo': bool(tipo.get('completed')),
+                        'estado': tipo.get('state') or '', 'detalhe': tipo.get('shortDetail') or tipo.get('detail') or '',
                         'times': times, 'detalhes': c.get('details') or []})
         except Exception:
             log('E|normaliza', traceback.format_exc()[-300:].replace('\n', ' / '))
@@ -905,7 +906,7 @@ def sb_todos(path):
         off += 1000
 
 def sb_grava(linhas):
-    """A ÚNICA escrita do robô: a tabela dele (apuracoes). Não existe escrita em apostas neste arquivo."""
+    """Escrita do robô: só nas tabelas dele (apuracoes aqui, apuracao_avisos nos avisos). Não existe escrita em apostas neste arquivo."""
     for i in range(0, len(linhas), 200):
         r = requests.post(f'{SB_URL}/rest/v1/apuracoes?on_conflict=aposta_id',
                           headers=_cab({'Prefer': 'resolution=merge-duplicates,return=minimal'}),
@@ -1054,7 +1055,7 @@ def atualiza(l, a, r, agora, hoje):
         t0, t1 = j['times']
         casa, fora = (t0, t1) if t0['casa'] else (t1, t0)
         jogos.append({'k': k, 'id': j['id'], 'ia': ia, 'como': como, 'esp': j['esp'], 'casa': nome_time(casa), 'fora': nome_time(fora),
-                      'inicio': iso(j['utc']), 'situacao': j['status']})
+                      'inicio': iso(j['utc']), 'situacao': j['status'], 'dia_espn': str(j['dia_espn'])})
     l.update(jogos=jogos or None, inicio=iso(min(j['utc'] for _, j, _, _ in r['jogos'])) if r['jogos'] else None,
              status_proposto=r['status'], classe=cl, motivo=motivo[:1500], fecharia=bool(r['status'] and not r['ressalvas']),
              proposto_em=iso(agora) if r['status'] else None, status_na_hora=a['status'] if r['status'] else None,
@@ -1109,7 +1110,7 @@ def ciclo(cli):
         if not l or l.get('final') or not l.get('ficha') or a['D'] > limite or l.get('texto_hash') != resumo_txt(a):
             continue
         px = de_iso(l.get('proxima_em'))
-        if px and px > agora:
+        if px and px > agora and a['id'] not in URGENTE:
             continue
         vez.append(a)
     casados = casa_lote(cli, vez, linhas) if vez else {}
@@ -1128,6 +1129,7 @@ def ciclo(cli):
             log(f"PROPOSTA {a['id'][:8]} {a['data_evento']} {a['esporte']} | {curto(a.get('evento'), 40)} ~ {curto(a.get('entrada'), 60)} | "
                 f"robô {r['status']} ({l['classe']}) | aposta {a['status']}{igual} | {curto(l['motivo'], 220)}")
 
+    URGENTE.clear()
     if gravar:
         sb_grava(list(gravar.values()))
     abertas = sum(1 for a in apostas if (linhas.get(a['id']) or {}).get('ficha') and not (linhas.get(a['id']) or {}).get('final'))
@@ -1137,20 +1139,315 @@ def ciclo(cli):
     return {'apostas': len(apostas), 'fichas': feitas, 'vez': len(vez), 'propostas': propostas, 'gravadas': len(gravar)}
 
 
+# ------------------------------------------------------------------ avisos no Telegram
+TG_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
+TG_CHAT = os.environ.get('TELEGRAM_CHAT', '')
+TG_MODO = os.environ.get('AP_TELEGRAM', 'desligado').strip().lower()     # desligado | ensaio (só escreve no log) | ligado
+TG_DESDE = de_iso(os.environ.get('AP_TELEGRAM_DESDE', ''))               # em ensaio: passa a mandar de verdade a partir desta hora
+AVISOS = int(os.environ.get('AP_AVISOS', '120') or 120)                  # segundos entre uma olhada e outra nos jogos ao vivo
+TETO_HORA = 90                                                           # mensagens novas por hora, no máximo (trava contra enxurrada)
+MEM = {}            # chave -> {'msg_id', 'texto', 'estado', 'quando'}; em modo ligado também vai pra tabela apuracao_avisos
+MEM_OK = [False]    # já carregou da tabela?
+ENVIOS = []         # horários das mensagens novas (pra trava)
+URGENTE = set()     # apostas pra apurar já: o jogo acabou de terminar
+SEMANA = ('seg', 'ter', 'qua', 'qui', 'sex', 'sáb', 'dom')
+
+def tg_vivo():
+    return bool(TG_TOKEN and TG_CHAT) and (TG_MODO == 'ligado' or (TG_MODO == 'ensaio' and TG_DESDE is not None and agora_utc() >= TG_DESDE))
+
+def tg(metodo, **campos):
+    """Chamada ao Telegram. O erro nunca carrega o endereço (que tem o token)."""
+    try:
+        r = requests.post(f'https://api.telegram.org/bot{TG_TOKEN}/{metodo}', json=campos, timeout=20)
+        j = r.json()
+    except Exception as e:
+        raise RuntimeError(f'telegram {metodo}: {type(e).__name__}') from None
+    if not j.get('ok'):
+        raise RuntimeError(f"telegram {metodo}: {j.get('error_code')} {j.get('description')}")
+    return j.get('result')
+
+def av_carrega():
+    """Na primeira olhada em modo ligado: esquece o que era ensaio e pega da tabela o que já foi mandado."""
+    if MEM_OK[0] or not tg_vivo():
+        return
+    MEM.clear()
+    desde = iso(agora_utc() - timedelta(days=3))
+    for l in sb_get(f'apuracao_avisos?select=chave,msg_id,texto,estado,atualizado_em&atualizado_em=gte.{desde}&chat_id=eq.{TG_CHAT}'):
+        MEM[l['chave']] = {'msg_id': l.get('msg_id'), 'texto': l.get('texto'), 'estado': l.get('estado'), 'quando': de_iso(l.get('atualizado_em'))}
+    MEM_OK[0] = True
+
+def av_guarda(chave, **campos):
+    e = MEM.setdefault(chave, {'msg_id': None, 'texto': None, 'estado': None, 'quando': None})
+    e.update(campos)
+    e['quando'] = agora_utc()
+    if tg_vivo():
+        try:
+            r = requests.post(f'{SB_URL}/rest/v1/apuracao_avisos?on_conflict=chave',
+                              headers=_cab({'Prefer': 'resolution=merge-duplicates,return=minimal'}),
+                              data=json.dumps([{'chave': chave, 'chat_id': int(TG_CHAT), 'msg_id': e['msg_id'], 'texto': e['texto'],
+                                                'estado': e['estado'], 'atualizado_em': iso(e['quando'])}], ensure_ascii=False).encode('utf-8'), timeout=30)
+            r.raise_for_status()
+        except Exception as ex:
+            log('ERRO ao guardar aviso', chave, type(ex).__name__)
+
+def av_manda(chave, texto, estado, novo=False, avisa=False, responde=None):
+    """Manda ou edita a mensagem da chave. Em ensaio só escreve no log. Devolve True se mudou algo."""
+    e = MEM.get(chave) or {}
+    if not novo and e.get('texto') == texto and e.get('estado') == estado:
+        return False
+    vivo = tg_vivo()
+    if not vivo:
+        log(f"ENSAIO [{chave}] {'NOVA' if (novo or not e.get('msg_id')) else 'edita'}{' (com aviso)' if avisa else ''}:\n{texto}")
+        av_guarda(chave, texto=texto, estado=estado, msg_id=e.get('msg_id') or (-1 if not novo else -2))
+        return True
+    try:
+        if e.get('msg_id') and e['msg_id'] > 0 and not novo:
+            if e.get('texto') != texto:
+                try:
+                    tg('editMessageText', chat_id=TG_CHAT, message_id=e['msg_id'], text=texto)
+                except RuntimeError as ex:
+                    if 'not modified' not in str(ex):
+                        raise
+            av_guarda(chave, texto=texto, estado=estado)
+            return True
+        agora = time.time()
+        ENVIOS[:] = [t for t in ENVIOS if agora - t < 3600]
+        if len(ENVIOS) >= TETO_HORA:
+            log('TRAVA: passou de', TETO_HORA, 'mensagens novas em 1h; não mandei', chave)
+            return False
+        campos = {'chat_id': TG_CHAT, 'text': texto, 'disable_notification': not avisa}
+        if responde and responde > 0:
+            campos['reply_to_message_id'] = responde
+            campos['allow_sending_without_reply'] = True
+        ENVIOS.append(agora)
+        m = tg('sendMessage', **campos)
+        time.sleep(0.4)
+        av_guarda(chave, texto=texto, estado=estado, msg_id=int(m['message_id']))
+        return True
+    except Exception as ex:
+        log('ERRO no Telegram', chave, str(ex)[:200])
+        return False
+
+def n2(x):
+    s = f'{abs(x):,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+    return s
+
+def din(x, moeda, sinal=False):
+    pre = 'US$ ' if moeda == 'USD' else 'R$ '
+    return pre + (('+' if x >= 0 else '-') if sinal else ('-' if x < 0 else '')) + n2(x)
+
+def uni(x, sinal=False):
+    return (('+' if x >= 0 else '-') if sinal else ('-' if x < 0 else '')) + n2(x) + 'u'
+
+def fl(v):
+    try:
+        return float(v or 0)
+    except Exception:
+        return 0.0
+
+def previsto(a, st):
+    """Lucro que a aposta teria com o resultado st: (unidades, dinheiro)."""
+    odd, u = fl(a.get('odd')), fl(a.get('stake_unidades'))
+    d = fl(a.get('stake_usd')) if a.get('moeda') == 'USD' else fl(a.get('stake_reais'))
+    k = {'WON': odd - 1, 'HALF WON': (odd - 1) / 2, 'VOID': 0.0, 'HALF LOST': -0.5, 'LOST': -1.0}.get(st)
+    return (None, None) if k is None else (u * k, d * k)
+
+BOLA = {'WON': '🟢', 'HALF WON': '🟢', 'LOST': '🔴', 'HALF LOST': '🔴', 'VOID': '⚪'}
+NOME_ST = {'WON': 'green', 'HALF WON': 'meio green', 'LOST': 'red', 'HALF LOST': 'meio red', 'VOID': 'devolvida'}
+
+def rotulo_aposta(a):
+    tipo = (a.get('tipo_aposta') or '').strip()
+    pre = (tipo + ': ') if tipo.lower() in ('dupla', 'tripla', 'multipla', 'múltipla') else ''
+    return pre + curto(a.get('entrada') or a.get('evento'), 70) + (f" @{fl(a.get('odd')):.2f}".replace('.', ',') if a.get('odd') else '')
+
+def hora_brt(d):
+    return d.astimezone(BRT).strftime('%H:%M')
+
+def avisos():
+    """Uma olhada: painel do dia e uma mensagem por jogo. Lê do banco e do placar; só escreve em apuracao_avisos."""
+    if TG_MODO == 'desligado':
+        return
+    av_carrega()
+    agora = agora_utc()
+    brt = agora.astimezone(BRT)
+    dia = (brt - timedelta(hours=5)).date()                 # o "dia" do painel vira às 5h
+    aps = sb_todos('apostas?select=id,data_evento,evento,entrada,tipo_aposta,status,odd,moeda,stake_unidades,stake_reais,stake_usd,'
+                   f'lucro_unidades,lucro_reais,lucro_usd&data_evento=gte.{dia - timedelta(days=1)}&data_evento=lte.{dia + timedelta(days=1)}&order=id.asc')
+    aps = [a for a in aps if a['id'] not in PULAR]
+    linhas = carrega_linhas([a['id'] for a in aps]) if aps else {}
+    PLACARES.clear()
+
+    # jogos com aposta: chave -> dados
+    jogos = {}
+    for a in aps:
+        l = linhas.get(a['id']) or {}
+        for g in (l.get('jogos') or []):
+            ini = de_iso(g.get('inicio'))
+            if not ini or not (agora - timedelta(hours=8) <= ini <= agora + timedelta(hours=20)):
+                continue
+            j = jogos.setdefault((g.get('esp'), str(g.get('id'))), {'esp': g.get('esp'), 'id': str(g.get('id')), 'casa': g.get('casa'), 'fora': g.get('fora'),
+                                                                   'inicio': ini, 'dia_espn': g.get('dia_espn'), 'apostas': {}})
+            j['apostas'][a['id']] = (a, l)
+
+    # situação de agora de cada jogo que já devia ter começado
+    for j in jogos.values():
+        j['agora'] = None
+        if j['inicio'] > agora + timedelta(minutes=3) or j['esp'] not in CAM or (MEM.get(f"jogo:{j['esp']}:{j['id']}") or {}).get('estado') == 'fim':
+            continue
+        try:
+            if j.get('dia_espn'):
+                lista = jogos_do_dia(j['esp'], date.fromisoformat(j['dia_espn']))
+            else:
+                lista = candidatos(j['esp'], j['inicio'].astimezone(BRT).date())
+            j['agora'] = next((x for x in lista if x['id'] == j['id']), None)
+        except Exception:
+            log('ERRO ao ler o placar ao vivo', j['id'], traceback.format_exc()[-200:].replace('\n', ' / '))
+
+    def placar_txt(j):
+        x = j['agora']
+        if not x:
+            return f"{j['casa']} x {j['fora']}"
+        t0, t1 = x['times']
+        casa, fora = (t0, t1) if t0['casa'] else (t1, t0)
+        if casa['placar'] is None or fora['placar'] is None:
+            return f"{j['casa']} x {j['fora']}"
+        return f"{nome_time(casa)} {casa['placar']}x{fora['placar']} {nome_time(fora)}"
+
+    def linha_aposta(a, l, com_resultado):
+        st = a['status'] if a['status'] != 'PENDING' else (l.get('status_proposto') if com_resultado else None)
+        if st in BOLA:
+            quem = '' if a['status'] != 'PENDING' else (' (robô)' if l.get('classe') == 'apurou' else ' (robô, confere)')
+            return f"{BOLA[st]} {rotulo_aposta(a)} · {NOME_ST[st]}{quem}"
+        if com_resultado:
+            return f"⚪ {rotulo_aposta(a)} · sem apuração automática"
+        return f"· {rotulo_aposta(a)}"
+
+    # uma mensagem por jogo
+    vivos, seguir = [], []
+    for chave_j, j in sorted(jogos.items(), key=lambda x: x[1]['inicio']):
+        chave = f"jogo:{j['esp']}:{j['id']}"
+        e = MEM.get(chave) or {}
+        x = j['agora']
+        lista = sorted(j['apostas'].values(), key=lambda al: al[0]['id'])
+        if x is None or x.get('estado') == 'pre':
+            if j['inicio'] > agora:
+                seguir.append(j)
+            continue
+        if x.get('estado') == 'in' or (not x['completo'] and x.get('estado') != 'post'):
+            vivos.append(j)
+            txt = f"{placar_txt(j)} · {x.get('detalhe') or 'ao vivo'}\n" + '\n'.join(linha_aposta(a, l, False) for a, l in lista)
+            if e.get('estado') in (None, 'pre'):
+                av_manda(chave, 'Começou · ' + txt, 'vivo', novo=not e.get('msg_id'))
+            elif e.get('estado') == 'vivo':
+                av_manda(chave, txt, 'vivo')
+            continue
+        if x['completo'] and e.get('estado') != 'fim':
+            if agora - j['inicio'] > timedelta(hours=6) and e.get('estado') is None:
+                MEM[chave] = {'msg_id': None, 'texto': None, 'estado': 'fim', 'quando': agora}      # jogo antigo: não anuncia
+                continue
+            abertas = [a for a, l in lista if a['status'] == 'PENDING' and not l.get('final')]
+            desde = e.get('fim_visto') or agora
+            e2 = MEM.setdefault(chave, {'msg_id': None, 'texto': None, 'estado': e.get('estado'), 'quando': agora})
+            e2['fim_visto'] = desde
+            if abertas and agora - desde < timedelta(minutes=12):
+                URGENTE.update(a['id'] for a in abertas)                   # pede a apuração já e espera a próxima olhada
+                if e.get('estado') == 'vivo':
+                    av_manda(chave, f"{placar_txt(j)} · fim de jogo\n" + '\n'.join(linha_aposta(a, l, False) for a, l in lista), 'vivo')
+                continue
+            fim = f"Fim · {placar_txt(j)}\n" + '\n'.join(linha_aposta(a, l, True) for a, l in lista)
+            if e.get('msg_id') and e['msg_id'] > 0:
+                av_manda(chave, f"{placar_txt(j)} · fim de jogo\n" + '\n'.join(linha_aposta(a, l, True) for a, l in lista), 'vivo')
+            if av_manda(chave + ':fim', fim, 'fim', novo=True, avisa=True, responde=(MEM.get(chave) or {}).get('msg_id')):
+                MEM.setdefault(chave, {})['estado'] = 'fim'
+                av_guarda(chave, estado='fim')
+
+    # painel do dia
+    do_dia = [a for a in aps if a['data_evento'] == str(dia)]
+    if do_dia or MEM.get(f'painel:{dia}'):
+        tot = {'n': 0, 'u': 0.0, 'BRL': 0.0, 'USD': 0.0, 'pn': 0, 'pu': 0.0, 'pBRL': 0.0, 'pUSD': 0.0, 'lu': 0.0, 'lBRL': 0.0, 'lUSD': 0.0,
+               'ru': 0.0, 'rBRL': 0.0, 'rUSD': 0.0, 'rn': 0, 'conf': 0}
+        for a in do_dia:
+            m = 'USD' if a.get('moeda') == 'USD' else 'BRL'
+            d = fl(a.get('stake_usd')) if m == 'USD' else fl(a.get('stake_reais'))
+            tot['n'] += 1
+            tot['u'] += fl(a.get('stake_unidades'))
+            tot[m] += d
+            l = linhas.get(a['id']) or {}
+            if a['status'] == 'PENDING':
+                tot['pn'] += 1
+                tot['pu'] += fl(a.get('stake_unidades'))
+                tot['p' + m] += d
+                if l.get('status_proposto'):
+                    pu, pd = previsto(a, l['status_proposto'])
+                    if pu is not None:
+                        tot['rn'] += 1
+                        tot['ru'] += pu
+                        tot['r' + m] += pd
+                    if l.get('classe') == 'conferir':
+                        tot['conf'] += 1
+            else:
+                tot['lu'] += fl(a.get('lucro_unidades'))
+                tot['l' + m] += fl(a.get('lucro_usd')) if m == 'USD' else fl(a.get('lucro_reais'))
+        p = [f"Hoje · {SEMANA[dia.weekday()]} {dia.strftime('%d/%m')} · {brt.strftime('%H:%M')}",
+             f"Entradas {tot['n']} · investido {uni(tot['u'])}",
+             f"{din(tot['BRL'], 'BRL')} · {din(tot['USD'], 'USD')}",
+             f"Pendentes {tot['pn']} · {uni(tot['pu'])} · {din(tot['pBRL'], 'BRL')} · {din(tot['pUSD'], 'USD')}",
+             f"Resultado marcado {uni(tot['lu'], True)} · {din(tot['lBRL'], 'BRL', True)} · {din(tot['lUSD'], 'USD', True)}"]
+        if tot['rn']:
+            p.append(f"Com o que o robô já apurou ({tot['rn']}): {uni(tot['lu'] + tot['ru'], True)} · {din(tot['lBRL'] + tot['rBRL'], 'BRL', True)} · "
+                     f"{din(tot['lUSD'] + tot['rUSD'], 'USD', True)}" + (f" · {tot['conf']} pra conferir" if tot['conf'] else ''))
+        if vivos:
+            p.append('')
+            p.append('Ao vivo')
+            for j in vivos[:12]:
+                p.append(f"{placar_txt(j)} · {(j['agora'] or {}).get('detalhe') or ''} · {len(j['apostas'])} " + ('entrada' if len(j['apostas']) == 1 else 'entradas'))
+        if seguir:
+            p.append('')
+            p.append('A seguir')
+            for j in seguir[:10]:
+                p.append(f"{hora_brt(j['inicio'])} {j['casa']} x {j['fora']} · {len(j['apostas'])} " + ('entrada' if len(j['apostas']) == 1 else 'entradas'))
+            if len(seguir) > 10:
+                p.append(f'e mais {len(seguir) - 10}')
+        texto = '\n'.join(p)
+        chave = f'painel:{dia}'
+        e = MEM.get(chave) or {}
+        sem_hora = lambda s: '\n'.join((s or '').split('\n')[1:])
+        if not e.get('msg_id'):
+            if av_manda(chave, texto, 'painel', novo=True) and tg_vivo():
+                try:
+                    tg('pinChatMessage', chat_id=TG_CHAT, message_id=MEM[chave]['msg_id'], disable_notification=True)
+                except Exception as ex:
+                    log('aviso: não consegui fixar o painel:', str(ex)[:160])
+        elif sem_hora(e.get('texto')) != sem_hora(texto):            # só edita quando muda algo além da hora
+            av_manda(chave, texto, 'painel')
+
+
+
 def main():
-    log(f'apurador EM SOMBRA (só propõe; não altera aposta) | modelo {MODELO} | ciclo {CICLO}s | janela -{ATRAS}/+{FRENTE} dias')
+    log(f'apurador EM SOMBRA (só propõe; não altera aposta) | modelo {MODELO} | ciclo {CICLO}s | janela -{ATRAS}/+{FRENTE} dias | '
+        f"telegram {TG_MODO}" + (f' (manda de verdade a partir de {iso(TG_DESDE)})' if TG_MODO == 'ensaio' and TG_DESDE else ''))
     if not SB_KEY or not os.environ.get('ANTHROPIC_KEY'):
         log('ERRO: falta SUPABASE_KEY ou ANTHROPIC_KEY nas variáveis do serviço')
         time.sleep(600)
         sys.exit(1)
+    if TG_MODO != 'desligado' and not (TG_TOKEN and TG_CHAT):
+        log('aviso: telegram sem TELEGRAM_TOKEN ou TELEGRAM_CHAT; fica só no log')
     cli = cliente()
+    prox_ciclo = prox_avisos = 0.0
     while True:
-        t0 = time.time()
-        try:
-            ciclo(cli)
-        except Exception:
-            log('ERRO no ciclo:', traceback.format_exc()[-1500:].replace('\n', ' / '))
-        time.sleep(max(20, CICLO - (time.time() - t0)))
+        if time.time() >= prox_ciclo or URGENTE:
+            try:
+                ciclo(cli)
+            except Exception:
+                log('ERRO no ciclo:', traceback.format_exc()[-1500:].replace('\n', ' / '))
+            prox_ciclo = time.time() + CICLO
+        if TG_MODO != 'desligado' and time.time() >= prox_avisos:
+            try:
+                avisos()
+            except Exception:
+                log('ERRO nos avisos:', traceback.format_exc()[-1200:].replace('\n', ' / '))
+            prox_avisos = time.time() + AVISOS
+        time.sleep(15)
 
 
 if __name__ == '__main__':
