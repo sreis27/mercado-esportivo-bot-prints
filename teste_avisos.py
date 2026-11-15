@@ -169,8 +169,9 @@ confere('painel: cabeçalho e totais, uma frase por linha', '''📅 Hoje · seg 
 ''' in p['antes'], True)
 confere('painel: jogo de outro dia leva o dia da semana', m.SEMANA[0], 'seg')
 confere('antes do jogo não tem mensagem de jogo', 'jogo:' in p['antes'], False)
-confere('a consulta dos avisos pega os 3 dias e as pendentes mais velhas, com a casa',
-        any('bookie_id' in c and 'or=(and(data_evento.gte.2026-11-08,data_evento.lte.2026-11-10),and(status.eq.PENDING,data_evento.gte.2026-10-10,data_evento.lt.2026-11-08))' in c
+confere('a consulta dos avisos pega os 3 dias, as pendentes mais velhas e as dos próximos 7 dias, com a casa',
+        any('bookie_id' in c and 'or=(and(data_evento.gte.2026-11-08,data_evento.lte.2026-11-10),and(status.eq.PENDING,data_evento.gte.2026-10-10,data_evento.lt.2026-11-08),'
+            'and(status.eq.PENDING,data_evento.gt.2026-11-10,data_evento.lte.2026-11-16))' in c
             for c in CONSULTAS), True)
 print('--- começou (ensaio):'); print(p['comecou'])
 confere('começou: a partida e em que entrada estamos (odd, valor na moeda dela, casa)', '''⚽ Ao vivo · Lazio 1x0 Napoli · 34'

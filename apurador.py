@@ -3,8 +3,11 @@
 Roda sozinho, em ciclos. Para cada aposta do período: lê o texto e monta a ficha (modelo), acha o jogo numa
 fonte pública de placar e, quando o jogo acaba, apura pela regra do mercado.
 
-EM SOMBRA: o robô só escreve na tabela `apuracoes` (a proposta e a prova). Não altera nem apaga aposta nenhuma
-e não manda mensagem pra lugar nenhum. Na dúvida, não propõe; e quando propõe com ressalva, diz qual.
+EM SOMBRA: o robô escreve nas tabelas dele (`apuracoes`, `apuracao_avisos`, `apuracao_divergencias`) e manda os avisos
+no grupo. Não marca resultado nem apaga aposta. Em `apostas` faz uma coisa só, pedida pelo Samuel em 15/11: múltipla com
+jogos em dias diferentes fica no dia do 1º jogo; se as pernas que já acabaram não perderam, ela passa pro dia do jogo
+seguinte (fica no histórico da aposta como "Robô"; AP_MULTIPLA_DATA=desligado desliga).
+Na dúvida, não propõe; e quando propõe com ressalva, diz qual.
 """
 import os, re, sys, json, time, hashlib, unicodedata, traceback, concurrent.futures as cf
 from datetime import date, datetime, timedelta, timezone
@@ -23,8 +26,10 @@ BRT = timezone(timedelta(hours=-3))
 ESPN = 'https://site.api.espn.com/apis/site/v2/sports'
 CAM = {'futebol': 'soccer/all', 'nba': 'basketball/nba', 'nhl': 'hockey/nhl', 'nfl': 'football/nfl', 'mma': 'mma/ufc'}
 ROTULO = {'Futebol': 'futebol', 'Futebol Feminino': 'futebol', 'NBA': 'nba', 'NHL': 'nhl', 'NFL': 'nfl',
-          'MMA': 'mma', 'UFC': 'mma', '(sem esporte)': None}
+          'MMA': 'mma', 'UFC': 'mma', '(sem esporte)': None, 'Múltiplos': None}     # Múltiplos: a ficha diz o esporte de cada perna
 PULAR = {'015db6d4-9953-40c7-b29a-96b43a49f198'}               # aposta consolidada: o robô não olha
+MULTIPLA_DATA = os.environ.get('AP_MULTIPLA_DATA', 'ligado').strip().lower() != 'desligado'   # muda a data da múltipla que segue viva
+ROBO = 'Robô'                                                  # nome do robô no histórico das apostas
 USO = {'ficha': [0, 0, 0, 0, 0], 'casa': [0, 0, 0, 0, 0]}      # entrada nova, saída, chamadas, cache lido, cache escrito
 N_REQ = [0]
 
@@ -875,7 +880,10 @@ def junta_pernas(res):
         firmes = [r for r in perdidas if not r[3]]
         return 'LOST', None, textos, ([] if firmes else [r[3] for r in perdidas])
     if None in sts:
-        cl = sorted([c for s, c, _, _ in res if s is None], key=lambda c: ORDEM_CLASSE.index(c) if c in ORDEM_CLASSE else 99)[0]
+        abertas = [c for s, c, _, _ in res if s is None]
+        # perna sem placar (outro esporte) não encerra a múltipla enquanto outra perna ainda pode perder: se perder, é red
+        vivas = [c for c in abertas if c != 'fora']
+        cl = sorted(vivas or abertas, key=lambda c: ORDEM_CLASSE.index(c) if c in ORDEM_CLASSE else 99)[0]
         return None, cl, textos, []
     if any(s in ('HALF WON', 'HALF LOST') for s in sts):
         return None, 'regra_casa', textos + ' (múltipla com meia perna)', []
@@ -885,15 +893,25 @@ def junta_pernas(res):
     return 'WON', None, textos, ress
 
 def apura_aposta(a, f, casados):
-    """Apura todas as pernas da aposta. Devolve dict com status, classe, motivo, ressalvas e os jogos casados."""
-    res, jogos = [], []
-    for k, p in enumerate(f.get('pernas') or []):
+    """Apura todas as pernas da aposta. Devolve dict com status, classe, motivo, ressalvas, os jogos casados
+    e, em 'pernas', o resultado de cada perna: (k, status|None, classe|None, jogo|None)."""
+    res, jogos, pernas = [], [], []
+    lista = f.get('pernas') or []
+
+    def como_de(k):
+        j, _, como = casados.get((a['id'], k), (None, None, None))
+        return como if j else None
+    # múltipla fica no dia do 1º jogo (Samuel, 15/11): perna dias depois, com outra perna casada perto da data, não é data errada
+    perto = len(lista) > 1 and any(como_de(k) not in (None, 'data') for k in range(len(lista)))
+    for k, p in enumerate(lista):
         if not isinstance(p, dict) or p.get('esp') not in CAM:
             res.append((None, 'fora', 'esporte sem fonte de placar', None))
+            pernas.append((k, None, 'fora', None))
             continue
         j, ia, como = casados.get((a['id'], k), (None, None, 'sem_jogo'))
         if not j:
             res.append((None, como or 'sem_jogo', f"não achei o jogo: {p.get('a') or p.get('jog')} x {p.get('b')}", None))
+            pernas.append((k, None, como or 'sem_jogo', None))
             continue
         jogos.append((k, j, ia, como))
         try:
@@ -902,20 +920,42 @@ def apura_aposta(a, f, casados):
                 raise NaoSei('regra_casa', 'meia linha sem regra')
             if como == 'jogador_outro_jogo':
                 ressalva = '; '.join(x for x in (ressalva, 'o jogo do jogador não é o que está escrito no evento') if x)
-            if como == 'data':
+            if como == 'data' and abs((j['dia_brt'] - a['D']).days) > 1 and not (perto and j['dia_brt'] > a['D']):
                 ressalva = '; '.join(x for x in (ressalva, f"a data da aposta ({a['data_evento']}) não é a do jogo ({j['dia_brt']})") if x)
             res.append((s, None, ev, ressalva))
+            pernas.append((k, s, None, j))
         except NaoSei as e:
             res.append((None, e.classe, f'{rotulo_jogo(j)} → {e.motivo}', None))
+            pernas.append((k, None, e.classe, j))
         except Exception:
             res.append((None, 'erro', traceback.format_exc()[-300:].replace('\n', ' / '), None))
+            pernas.append((k, None, 'erro', j))
     if not res:
-        return {'status': None, 'classe': 'ficha', 'motivo': 'ficha sem pernas', 'ressalvas': [], 'jogos': []}
+        return {'status': None, 'classe': 'ficha', 'motivo': 'ficha sem pernas', 'ressalvas': [], 'jogos': [], 'pernas': []}
     st, cl, txt, ress = junta_pernas(res)
     duvida = (f.get('duvida') or '').strip()
     if st and duvida:
         ress = ress + ['leitura com dúvida: ' + duvida]
-    return {'status': st, 'classe': cl, 'motivo': txt, 'ressalvas': ress, 'jogos': jogos}
+    return {'status': st, 'classe': cl, 'motivo': txt, 'ressalvas': ress, 'jogos': jogos, 'pernas': pernas}
+
+
+def data_seguinte(a, r):
+    """Múltipla que segue viva: as pernas que já acabaram não perderam e as que faltam são de outro dia.
+    Devolve a data do próximo jogo (pra aposta passar pra ela) ou None.
+    O Samuel planilha a múltipla no dia do 1º jogo (15/11): perdeu ali, é red ali; ganhou, a aposta vai pro dia do jogo seguinte."""
+    if r.get('status') or a.get('status') != 'PENDING':
+        return None
+    pernas = r.get('pernas') or []
+    if len(pernas) < 2:
+        return None
+    feitas = [p for p in pernas if p[1] is not None]
+    faltam = [p for p in pernas if p[1] is None]
+    if not feitas or not faltam or any(p[1] == 'LOST' for p in feitas):
+        return None
+    if any(p[2] != 'nao_terminou' or not p[3] for p in faltam):     # perna que o robô não sabe ler (sem jogo, mercado...) trava
+        return None
+    prox = min(p[3]['dia_brt'] for p in faltam)
+    return prox if prox > a['D'] else None
 
 
 # ------------------------------------------------------------------ banco
@@ -940,12 +980,32 @@ def sb_todos(path):
         off += 1000
 
 def sb_grava(linhas):
-    """Escrita do robô: só nas tabelas dele (apuracoes aqui; apuracao_avisos e apuracao_divergencias nos avisos). Não existe escrita em apostas neste arquivo."""
+    """Escrita do robô nas tabelas dele (apuracoes aqui; apuracao_avisos e apuracao_divergencias nos avisos). Em apostas, só sb_muda_data."""
     for i in range(0, len(linhas), 200):
         r = requests.post(f'{SB_URL}/rest/v1/apuracoes?on_conflict=aposta_id',
                           headers=_cab({'Prefer': 'resolution=merge-duplicates,return=minimal'}),
                           data=json.dumps(linhas[i:i + 200], ensure_ascii=False).encode('utf-8'), timeout=60)
         r.raise_for_status()
+
+def sb_muda_data(a, nova):
+    """A única escrita do robô em apostas: a múltipla que segue viva passa pro dia do jogo seguinte (pedido do Samuel, 15/11).
+    Só muda se a aposta ainda está pendente e na data que o robô leu; fica no histórico dela como "Robô".
+    Devolve False se a aposta mudou no meio do caminho (aí não mexe)."""
+    r = requests.patch(f"{SB_URL}/rest/v1/apostas?id=eq.{a['id']}&status=eq.PENDING&data_evento=eq.{a['data_evento']}",
+                       headers=_cab({'Prefer': 'return=representation'}),
+                       data=json.dumps({'data_evento': str(nova), 'atualizado_em': iso(agora_utc()), 'atualizado_por': ROBO},
+                                       ensure_ascii=False).encode('utf-8'), timeout=30)
+    r.raise_for_status()
+    if not r.json():
+        return False
+    try:
+        h = requests.post(f'{SB_URL}/rest/v1/historico_apostas', headers=_cab({'Prefer': 'return=minimal'}),
+                          data=json.dumps([{'aposta_id': a['id'], 'campo_alterado': 'data_evento', 'valor_anterior': a['data_evento'],
+                                            'valor_novo': str(nova), 'alterado_por': ROBO}], ensure_ascii=False).encode('utf-8'), timeout=30)
+        h.raise_for_status()
+    except Exception:
+        log('aviso: a data da múltipla mudou, mas o histórico da aposta não gravou', a['id'][:8], traceback.format_exc()[-200:].replace('\n', ' / '))
+    return True
 
 ESPORTES = {'quando': 0.0, 'mapa': {}}
 
@@ -1014,13 +1074,20 @@ def acha_jogo_adiante(p, D, fem):
                 achados[j['id']] = (j, ia)
     return list(achados.values())[0] if len(achados) == 1 else (None, None)
 
+def longe(g, D):
+    """O jogo guardado da perna ficou a mais de 1 dia da data da aposta (a múltipla passou pro dia do jogo seguinte):
+    pelo nome não acharia mais; reaproveita o casamento."""
+    ini = de_iso(g.get('inicio'))
+    return bool(ini) and abs((ini.astimezone(BRT).date() - D).days) > 1
+
 def casa_lote(cli, vez, linhas):
     """Casa cada perna das apostas da vez com um jogo. Devolve {(aposta_id, k): (jogo|None, ia, como|motivo)}."""
     casados, pendentes = {}, []
     for a in vez:
         l = linhas[a['id']]
         f = l.get('ficha') or {}
-        guardados = {g.get('k'): g for g in (l.get('jogos') or []) if isinstance(g, dict) and g.get('como') in ('modelo', 'data')}
+        guardados = {g.get('k'): g for g in (l.get('jogos') or []) if isinstance(g, dict) and g.get('id')
+                     and (g.get('como') in ('modelo', 'data') or longe(g, a['D']))}
         fem_ap = a['esporte'] == 'Futebol Feminino'
         for k, p in enumerate(f.get('pernas') or []):
             if not isinstance(p, dict) or p.get('esp') not in CAM:
@@ -1113,12 +1180,14 @@ def atualiza(l, a, r, agora, hoje):
         cl = 'sem_jogo'
     motivo = (r['motivo'] or '') + ((' | ressalva: ' + '; '.join(r['ressalvas'])) if r['ressalvas'] else '')
     jogos = []
+    st_perna = {k: s for k, s, _, _ in (r.get('pernas') or [])}    # resultado de cada perna (múltipla que segue viva)
     for k, j, ia, como in r['jogos']:
         t0, t1 = j['times']
         casa, fora = (t0, t1) if t0['casa'] else (t1, t0)
         jogos.append({'k': k, 'id': j['id'], 'ia': ia, 'como': como, 'esp': j['esp'], 'casa': nome_time(casa), 'fora': nome_time(fora),
-                      'inicio': iso(j['utc']), 'situacao': j['status'], 'dia_espn': str(j['dia_espn'])})
-    l.update(jogos=jogos or None, inicio=iso(min(j['utc'] for _, j, _, _ in r['jogos'])) if r['jogos'] else None,
+                      'inicio': iso(j['utc']), 'situacao': j['status'], 'dia_espn': str(j['dia_espn']), 'st': st_perna.get(k)})
+    abertos = [j['utc'] for k, j, _, _ in r['jogos'] if st_perna.get(k) is None] or [j['utc'] for _, j, _, _ in r['jogos']]
+    l.update(jogos=jogos or None, inicio=iso(min(abertos)) if abertos else None,     # início do próximo jogo que ainda conta
              status_proposto=r['status'], classe=cl, motivo=motivo[:1500], fecharia=bool(r['status'] and not r['ressalvas']),
              proposto_em=iso(agora) if r['status'] else None, status_na_hora=a['status'] if r['status'] else None,
              tentativas=tent, proxima_em=iso(prox), final=final, visto_em=iso(agora))
@@ -1176,7 +1245,7 @@ def ciclo(cli):
             continue
         vez.append(a)
     casados = casa_lote(cli, vez, linhas) if vez else {}
-    propostas = 0
+    propostas = movidas = 0
     for a in vez:
         l = linhas[a['id']]
         try:
@@ -1185,6 +1254,20 @@ def ciclo(cli):
             r = {'status': None, 'classe': 'erro', 'motivo': traceback.format_exc()[-300:].replace('\n', ' / '), 'ressalvas': [], 'jogos': []}
         atualiza(l, a, r, agora, hoje)
         gravar[a['id']] = l
+        nova = data_seguinte(a, r) if MULTIPLA_DATA else None
+        if nova:
+            try:
+                velha = a['data_evento']
+                if sb_muda_data(a, nova):
+                    a['data_evento'], a['D'] = str(nova), nova
+                    l['texto_hash'] = resumo_txt(a)          # mesma aposta: a ficha e os jogos casados continuam valendo
+                    movidas += 1
+                    log(f"DATA {a['id'][:8]} {velha} → {nova} | {curto(a.get('evento'), 30)} ~ {curto(a.get('entrada'), 60)} | "
+                        f"as pernas que acabaram não perderam; falta jogo em {nova}")
+                else:
+                    log(f"aviso: {a['id'][:8]} mudou no banco enquanto o robô olhava; a data fica como está")
+            except Exception:
+                log('ERRO ao mudar a data da múltipla', a['id'][:8], traceback.format_exc()[-300:].replace('\n', ' / '))
         if r['status']:
             propostas += 1
             igual = '' if a['status'] == 'PENDING' else (' = marcação' if a['status'] == r['status'] else ' ≠ MARCAÇÃO')
@@ -1196,9 +1279,9 @@ def ciclo(cli):
         sb_grava(list(gravar.values()))
     abertas = sum(1 for a in apostas if (linhas.get(a['id']) or {}).get('ficha') and not (linhas.get(a['id']) or {}).get('final'))
     log(f"ciclo {agora.astimezone(BRT).strftime('%d/%m %H:%M')} | apostas na janela {len(apostas)} | fichas novas {feitas} | sem fonte {fora} | "
-        f"na vez {len(vez)} | propostas {propostas} | abertas {abertas} | placar {N_REQ[0] - req0} pedidos | "
+        f"na vez {len(vez)} | propostas {propostas} | datas mudadas {movidas} | abertas {abertas} | placar {N_REQ[0] - req0} pedidos | "
         f"modelo {USO['ficha'][2] - uso0[0]}+{USO['casa'][2] - uso0[1]} chamadas")
-    return {'apostas': len(apostas), 'fichas': feitas, 'vez': len(vez), 'propostas': propostas, 'gravadas': len(gravar)}
+    return {'apostas': len(apostas), 'fichas': feitas, 'vez': len(vez), 'propostas': propostas, 'movidas': movidas, 'gravadas': len(gravar)}
 
 
 # ------------------------------------------------------------------ avisos no Telegram
@@ -1584,10 +1667,12 @@ def avisos():
     agora = agora_utc()
     brt = agora.astimezone(BRT)
     dia = (brt - timedelta(hours=5)).date()                 # o "dia" do painel vira às 5h
-    d0, d1, d30 = dia - timedelta(days=1), dia + timedelta(days=1), dia - timedelta(days=30)
+    d0, d1, d30, d7 = dia - timedelta(days=1), dia + timedelta(days=1), dia - timedelta(days=30), dia + timedelta(days=7)
+    # + as pendentes dos próximos dias: múltipla que passou pro dia do jogo seguinte ainda sai na mensagem do jogo que acabou
     aps = sb_todos('apostas?select=id,data_evento,evento,entrada,tipo_aposta,status,odd,moeda,stake_unidades,stake_reais,stake_usd,'
                    'lucro_unidades,lucro_reais,lucro_usd,esporte_id,bookie_id'
-                   f'&or=(and(data_evento.gte.{d0},data_evento.lte.{d1}),and(status.eq.PENDING,data_evento.gte.{d30},data_evento.lt.{d0}))&order=id.asc')
+                   f'&or=(and(data_evento.gte.{d0},data_evento.lte.{d1}),and(status.eq.PENDING,data_evento.gte.{d30},data_evento.lt.{d0}),'
+                   f'and(status.eq.PENDING,data_evento.gt.{d1},data_evento.lte.{d7}))&order=id.asc')
     aps = [a for a in aps if a['id'] not in PULAR and a.get('data_evento')]
     linhas = carrega_linhas([a['id'] for a in aps]) if aps else {}
     PLACARES.clear()
@@ -1628,13 +1713,52 @@ def avisos():
             return f"{j['casa']} x {j['fora']}"
         return f"{nome_time(casa)} {casa['placar']}x{fora['placar']} {nome_time(fora)}"
 
-    def linha_aposta(a, l, com_resultado):
+    def pernas_do_jogo(l, jid):
+        return [g for g in (l.get('jogos') or []) if isinstance(g, dict) and str(g.get('id')) == str(jid)]
+
+    def perna_feita(l, jid):
+        """As pernas desta aposta neste jogo já têm resultado: múltipla que segue viva nas outras não precisa esperar a apuração."""
+        aqui = pernas_do_jogo(l, jid)
+        return bool(aqui) and all(g.get('st') for g in aqui)
+
+    def segue_txt(a, l, j):
+        """Múltipla que continua depois deste jogo: qual é a próxima perna e se a aposta já passou pro dia dela."""
+        outras = sorted((g for g in (l.get('jogos') or []) if isinstance(g, dict) and str(g.get('id')) != str(j['id']) and not g.get('st')),
+                        key=lambda g: g.get('inicio') or '')
+        if outras:
+            g = outras[0]
+            ini = de_iso(g.get('inicio'))
+            txt = f"segue {quando_txt(ini, brt) + ' em ' if ini else 'em '}{g.get('casa')} x {g.get('fora')}"
+        else:
+            faltam = len((l.get('ficha') or {}).get('pernas') or []) - sum(1 for g in (l.get('jogos') or []) if isinstance(g, dict) and g.get('st'))
+            txt = 'segue na outra perna' if faltam == 1 else 'segue nas outras pernas'
+        dia_jogo = j['inicio'].astimezone(BRT).date()
+        if (a.get('data_evento') or '') > str(dia_jogo):
+            d = a['data_evento']
+            txt += f" · a aposta fica em {d[8:10]}/{d[5:7]}"
+        return txt
+
+    def linha_aposta(a, l, com_resultado, j=None):
         st = a['status'] if a['status'] != 'PENDING' else (l.get('status_proposto') if com_resultado else None)
         if st in BOLA:
             quem = '' if a['status'] != 'PENDING' else (' (robô)' if l.get('classe') == 'apurou' else ' (robô, confere)')
             return f"{BOLA[st]} {linha_entrada(a)} · {NOME_ST[st]}{quem}"
         if com_resultado:
+            aqui = pernas_do_jogo(l, j['id']) if j else []
+            n = len((l.get('ficha') or {}).get('pernas') or [])
+            feitas = [g for g in (l.get('jogos') or []) if isinstance(g, dict) and g.get('st')]
+            if a['status'] == 'PENDING' and aqui and all(g.get('st') in BOLA and g.get('st') != 'LOST' for g in aqui) and n > len(feitas):
+                sts = {g['st'] for g in aqui}
+                if len(sts) == 1:
+                    s = sts.pop()
+                    nome = NOME_ST[s] + (' nesta perna' if len(aqui) == 1 else ' nas pernas deste jogo')
+                else:
+                    s, nome = 'WON', 'sem red nas pernas deste jogo'
+                return f"{BOLA[s]} {linha_entrada(a)} · {nome}; {segue_txt(a, l, j)}"
             return f"⚪ {linha_entrada(a)} · sem apuração automática"
+        s = l.get('status_proposto')
+        if a['status'] == 'PENDING' and s in BOLA:         # múltipla que já se decidiu num jogo anterior: não é mais entrada em jogo
+            return f"{BOLA[s]} {linha_entrada(a)} · já {NOME_ST[s]}" + (' (robô)' if l.get('classe') == 'apurou' else ' (robô, confere)')
         return f"🎯 {linha_entrada(a)}"
 
     # uma mensagem por jogo
@@ -1662,7 +1786,7 @@ def avisos():
             if agora - j['inicio'] > timedelta(hours=6) and e.get('estado') is None:
                 MEM[chave] = {'msg_id': None, 'texto': None, 'estado': 'fim', 'quando': agora}      # jogo antigo: não anuncia
                 continue
-            abertas = [a for a, l in lista if a['status'] == 'PENDING' and not l.get('final')]
+            abertas = [a for a, l in lista if a['status'] == 'PENDING' and not l.get('final') and not perna_feita(l, j['id'])]
             desde = e.get('fim_visto') or agora
             e2 = MEM.setdefault(chave, {'msg_id': None, 'texto': None, 'estado': e.get('estado'), 'quando': agora})
             e2['fim_visto'] = desde
@@ -1671,9 +1795,9 @@ def avisos():
                 if e.get('estado') == 'vivo':
                     av_manda(chave, f"{ic} {placar_txt(j)} · fim de jogo\n" + '\n'.join(linha_aposta(a, l, False) for a, l in lista), 'vivo')
                 continue
-            fim = f"🏁 Fim · {placar_txt(j)}\n" + '\n'.join(linha_aposta(a, l, True) for a, l in lista)
+            fim = f"🏁 Fim · {placar_txt(j)}\n" + '\n'.join(linha_aposta(a, l, True, j) for a, l in lista)
             if e.get('msg_id') and e['msg_id'] > 0:
-                av_manda(chave, f"{ic} {placar_txt(j)} · fim de jogo\n" + '\n'.join(linha_aposta(a, l, True) for a, l in lista), 'vivo')
+                av_manda(chave, f"{ic} {placar_txt(j)} · fim de jogo\n" + '\n'.join(linha_aposta(a, l, True, j) for a, l in lista), 'vivo')
             if av_manda(chave + ':fim', fim, 'fim', novo=True, avisa=True, responde=(MEM.get(chave) or {}).get('msg_id')):
                 MEM.setdefault(chave, {})['estado'] = 'fim'
                 av_guarda(chave, estado='fim')
@@ -1785,7 +1909,8 @@ def avisos():
 
 
 def main():
-    log(f'apurador EM SOMBRA (só propõe; não altera aposta) | modelo {MODELO} | ciclo {CICLO}s | janela -{ATRAS}/+{FRENTE} dias | '
+    log(f'apurador EM SOMBRA (só propõe; não marca resultado) | múltipla que segue viva muda de dia: {"sim" if MULTIPLA_DATA else "não"} | '
+        f'modelo {MODELO} | ciclo {CICLO}s | janela -{ATRAS}/+{FRENTE} dias | '
         f"telegram {TG_MODO}" + (f' (manda de verdade a partir de {iso(TG_DESDE)})' if TG_MODO == 'ensaio' and TG_DESDE else ''))
     if not SB_KEY or not os.environ.get('ANTHROPIC_KEY'):
         log('ERRO: falta SUPABASE_KEY ou ANTHROPIC_KEY nas variáveis do serviço')
