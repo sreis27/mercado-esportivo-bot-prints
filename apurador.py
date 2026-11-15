@@ -857,6 +857,11 @@ def apura_perna_segura(p, jogo, ia, ap):
         else:
             aviso = None
         ress = '; '.join(x for x in (ress, aviso) if x) or None
+    if p.get('regra') == 'pa' and jogo['esp'] != 'futebol' and st in ('LOST', 'HALF LOST'):
+        # PA fora do futebol: a Gurubets paga o hóquei com 3 gols de vantagem (Samuel, 15/11); a 1win não paga PA.
+        # O robô ainda não acompanha a vantagem gol a gol fora do futebol: o red sai com ressalva.
+        quanto = {'nhl': '3 gols'}.get(jogo['esp'], 'a vantagem que a casa paga')
+        ress = '; '.join(x for x in (ress, f'com PA: se o time abriu {quanto} de vantagem, a casa paga antes e é green') if x)
     return st, prova, ress
 
 def junta_pernas(res):
