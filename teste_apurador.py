@@ -255,5 +255,31 @@ r, saida = roda()
 confere('c7 b18 proposta com ressalva (nunca fecha sozinha)', (L['b18']['status_proposto'], L['b18']['classe'], L['b18']['fecharia'], L['b18']['final']), ('WON', 'conferir', False, True))
 confere('c7 b18 diz que a data não bate', 'a data da aposta (2026-11-08) não é a do jogo (2026-11-13)' in (L['b18']['motivo'] or ''), True)
 confere('c7 sem erro no log', [x for x in saida.splitlines() if 'ERRO' in x], [])
+
+# ---------- hóquei que passou do tempo regulamentar (13/11: Ottawa 4x3 na prorrogação, St. Louis 1x0 nos pênaltis)
+def jogo_nhl(la, lb, pa, pb):
+    return {'esp': 'nhl', 'completo': True, 'status': 'STATUS_FINAL', 'dia_brt': date(2026, 11, 12),
+            'times': [{'id': '1', 'nomes': ['Ottawa Senators'], 'casa': True, 'placar': pa, 'linhas': la, 'venceu': pa > pb},
+                      {'id': '2', 'nomes': ['Colorado Avalanche'], 'casa': False, 'placar': pb, 'linhas': lb, 'venceu': pb > pa}]}
+ot = jogo_nhl([1, 1, 1, 1], [2, 0, 1, 0], 4, 3)            # 3x3 no tempo normal, 4x3 na prorrogação
+so = jogo_nhl([0, 0, 0, 0, 1], [0, 0, 0, 0, 0], 1, 0)      # 0x0 até a prorrogação, 1x0 nos pênaltis
+reg = jogo_nhl([2, 1, 1], [1, 1, 1], 4, 3)                 # decidido no tempo normal
+ML = dict(esp='nhl', a='Ottawa Senators', b='Colorado Avalanche', tipo='vencedor', lado='a')
+st, prova, ress = m.apura_perna_segura(ML, ot, 0, {})
+confere('hóquei ML ganho na prorrogação: green com ressalva do tempo regulamentar', (st, 'tempo regulamentar (60 min), é red' in (ress or '')), ('WON', True))
+st, prova, ress = m.apura_perna_segura(ML, so, 0, {})
+confere('hóquei ML ganho nos pênaltis: green com ressalva', (st, 'é red' in (ress or '')), ('WON', True))
+st, prova, ress = m.apura_perna_segura(dict(ML, lado='b'), ot, 0, {})
+confere('hóquei ML perdido na prorrogação: red e no tempo normal também red: sem ressalva', (st, ress), ('LOST', None))
+st, prova, ress = m.apura_perna_segura(ML, reg, 0, {})
+confere('hóquei decidido no tempo normal: sem ressalva', (st, ress), ('WON', None))
+st, prova, ress = m.apura_perna_segura(dict(ML, tipo='total', lado='over', linha=6.5, a=None, b=None), ot, 0, {})
+confere('hóquei over 6.5 com o gol da prorrogação: green, mas no tempo normal é red', (st, 'é red' in (ress or '')), ('WON', True))
+st, prova, ress = m.apura_perna_segura(dict(ML, tipo='total', lado='under', linha=7.5, a=None, b=None), ot, 0, {})
+confere('hóquei under 7.5: igual nos dois jeitos, sem ressalva', (st, ress), ('WON', None))
+st, prova, ress = m.apura_perna_segura(dict(ML, tipo='1x2'), ot, 0, {})
+confere('hóquei 1x2 escrito: já é tempo regulamentar, empate = red sem ressalva', (st, ress), ('LOST', None))
+st, prova, ress = m.apura_perna_segura(ML, jogo_nhl([], [], 4, 3), 0, {})
+confere('hóquei sem o placar por período: green com ressalva (não dá pra ver se foi pra prorrogação)', (st, 'placar por período' in (ress or '')), ('WON', True))
 print('gravações:', GRAVACOES, '| pedidos à fonte:', len(pedidos), '| chamadas:', chamadas)
 print('FALHAS:', falhas)

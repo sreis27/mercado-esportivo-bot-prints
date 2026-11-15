@@ -708,8 +708,9 @@ def liderou_por_2(jogo, idx):
     meu = 0 if idx == casa else 1
     return any(p[meu] - p[1 - meu] >= 2 for p in par)
 
-def apura_perna(p, jogo, ia, ap):
-    """Devolve (status, prova, ressalva). Levanta NaoSei quando não dá pra apurar com segurança."""
+def apura_perna(p, jogo, ia, ap, so_regulamentar=False):
+    """Devolve (status, prova, ressalva). Levanta NaoSei quando não dá pra apurar com segurança.
+    so_regulamentar: conta só o tempo regulamentar (hóquei sem a prorrogação e os pênaltis)."""
     esp, tipo = p['esp'], p.get('tipo')
     per, lado, met = p.get('per') or 'jogo', p.get('lado'), p.get('met')
     linha = num(p.get('linha')) if p.get('linha') is not None else None
@@ -769,9 +770,11 @@ def apura_perna(p, jogo, ia, ap):
             raise NaoSei('mercado', 'futebol: classificação/prorrogação')
         if lado not in ('a', 'b'):
             raise NaoSei('ficha', 'lado ' + str(lado))
-        s = placar(jogo, per, False)
+        s = placar(jogo, per, so_regulamentar)
         ga, gb = s[ia], s[ib]
         if ga == gb:
+            if so_regulamentar:
+                return 'LOST', ev, None          # aposta no time só pelo tempo regulamentar: empate perde
             raise NaoSei('regra_casa', 'empate no período/jogo em mercado de 2 lados')
         return ('WON' if (ga > gb) == (lado == 'a') else 'LOST'), ev, None
 
@@ -787,7 +790,7 @@ def apura_perna(p, jogo, ia, ap):
             raise NaoSei('regra_casa', 'handicap ao vivo depende do placar na hora da aposta')
         de_placar = (met or padrao) == padrao
         if de_placar:
-            s = placar(jogo, per, esp == 'futebol')
+            s = placar(jogo, per, esp == 'futebol' or so_regulamentar)
             f = [(s[0], s[0]), (s[1], s[1])]
         else:
             if per != 'jogo':
@@ -833,6 +836,29 @@ def apura_perna(p, jogo, ia, ap):
 
 ORDEM_CLASSE = ['fora', 'ficha', 'sem_jogo', 'ambiguo', 'aguarda', 'nao_terminou', 'mercado', 'sem_dado', 'regra_casa', 'erro']
 
+
+NOME_CURTO = {'WON': 'green', 'LOST': 'red', 'VOID': 'devolvida', 'HALF WON': 'meio green', 'HALF LOST': 'meio red'}
+
+def apura_perna_segura(p, jogo, ia, ap):
+    """apura_perna com a trava do hóquei: jogo que foi pra prorrogação ou pênaltis, em aposta cujo resultado muda
+    se a casa conta só o tempo regulamentar (o "1x2" de 60 min), sai com ressalva. O texto da aposta costuma vir
+    só como "ML" e não diz qual dos dois é (13/11: Ottawa e St. Louis na 1win eram de tempo regulamentar)."""
+    st, prova, ress = apura_perna(p, jogo, ia, ap)
+    if (jogo['esp'] == 'nhl' and (p.get('per') or 'jogo') == 'jogo' and p.get('tipo') in ('vencedor', 'handicap', 'total')
+            and (p.get('met') or 'gols') == 'gols' and not all(len(t['linhas']) == 3 for t in jogo['times'])):
+        try:                                     # mais de 3 períodos = prorrogação ou pênaltis; sem os períodos, não dá pra saber
+            st_reg = apura_perna(p, jogo, ia, ap, so_regulamentar=True)[0]
+        except NaoSei:
+            st_reg = None
+        if st_reg is None:
+            aviso = 'a fonte não trouxe o placar por período: se a aposta era de tempo regulamentar (60 min), confere'
+        elif st_reg != st:
+            aviso = f'foi pra prorrogação ou pênaltis: se a aposta era de tempo regulamentar (60 min), é {NOME_CURTO.get(st_reg, st_reg)}'
+        else:
+            aviso = None
+        ress = '; '.join(x for x in (ress, aviso) if x) or None
+    return st, prova, ress
+
 def junta_pernas(res):
     """res: [(status|None, classe, texto, ressalva)]. Devolve (status|None, classe, texto, ressalvas)."""
     textos = ' || '.join(t for _, _, t, _ in res if t)
@@ -866,7 +892,7 @@ def apura_aposta(a, f, casados):
             continue
         jogos.append((k, j, ia, como))
         try:
-            s, ev, ressalva = apura_perna(p, j, ia, a)
+            s, ev, ressalva = apura_perna_segura(p, j, ia, a)
             if s is None:
                 raise NaoSei('regra_casa', 'meia linha sem regra')
             if como == 'jogador_outro_jogo':
