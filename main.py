@@ -420,7 +420,7 @@ D. DATA DO EVENTO — prioridade de fontes (use a primeira disponível):
    2. DATA EXPLÍCITA NA DESCRIÇÃO: se o operador escreveu uma data na descrição, use essa.
    3. "LIVE" ou "AO VIVO" no print: a partida é HOJE (usar DATA DE HOJE do contexto).
    4. Nenhum dos anteriores: use a DATA DE HOJE do contexto como fallback.
-   MÚLTIPLA (dupla, tripla...) com jogos em dias diferentes: data_evento = a data do ÚLTIMO jogo (o mais tarde), que é quando a aposta fecha. Nunca a do primeiro.
+   MÚLTIPLA (dupla, tripla...) com jogos em dias diferentes: data_evento = a data do PRIMEIRO jogo (o mais cedo). É o primeiro dia em que a aposta pode ser decidida: se essa perna perder, a múltipla é red ali; se ganhar, o robô passa a aposta pro dia do jogo seguinte. Nunca a do último. Registre em "duvidas" as datas que usou, no formato "data: 1º jogo DD/MM, último DD/MM; planilhei no 1º".
    NUNCA infira data de evento por conhecimento prévio de calendário esportivo — o Claude Vision não tem acesso a dados em tempo real e pode errar. Só use datas que estejam EXPLICITAMENTE escritas no print ou na descrição.
 
    CUIDADO — IDENTIFICADORES DE GRUPO/TEMPORADA NÃO SÃO DATAS: strings em formato "AAAA.MM [texto]", "T[N]", "Season [N]", "[AAAA].[MM] [nome]" no cabeçalho, logo ou nome do canal do tipster são identificadores de grupo/temporada, NÃO são data do evento. Exemplos:
@@ -750,7 +750,7 @@ Responda APENAS com o JSON.
 
 ANTES DE RESPONDER, EXECUTE O CHECKLIST [R7]:
 1. Bet builder? → Print tem "CRIAR APOSTA"/"BET BUILDER" OU sinais estruturais (múltiplas seleções do mesmo jogador/jogo + 1 odd + 1 valor APOSTAR + sem botões individuais + opcionalmente "N Seleções" em destaque)? → 1 item só, tipo "Criar Aposta", entrada concatenada. Se NÃO, não invente.
-2. Data veio de texto EXPLÍCITO do print/descrição? → Se não, use a DATA DE HOJE do contexto. Múltipla com jogos em dias diferentes → a data do ÚLTIMO jogo.
+2. Data veio de texto EXPLÍCITO do print/descrição? → Se não, use a DATA DE HOJE do contexto. Múltipla com jogos em dias diferentes → a data do PRIMEIRO jogo.
 3. Times conhecidos? → Esporte marcado (específico: NBA/WNBA/Futebol Feminino se existir).
 4. Descrição começa com bookie? → Preenchi o bookie (incluindo "365"→Bet365, "AG"→Aposta Ganha).
 5. Palavra após bookie? → Preenchi a conta. Exceto se for palavra qualitativa ("Todas", "Várias") = null mas continua extração.
